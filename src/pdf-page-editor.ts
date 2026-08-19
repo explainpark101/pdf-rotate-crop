@@ -80,6 +80,7 @@ const PAGE_IMAGE_STORAGE_RENDER_SCALE = 1.25;
 /* DOM Elements */
 const pdfFileInput = document.getElementById('pdfFileInput');
 const pdfProjectFileInput = document.getElementById('pdfProjectFileInput');
+const btnOpenProjectFromDropzone = document.getElementById('btnOpenProjectFromDropzone');
 const dropzone = document.getElementById('dropzone');
 const canvasWrapper = document.getElementById('canvasWrapper');
 const pdfCanvas = document.getElementById('pdfCanvas');
@@ -314,6 +315,12 @@ function closeConfirmAfterProjectExportModal() {
 })();
 
 dropzone.addEventListener('click', () => pdfFileInput.click());
+
+btnOpenProjectFromDropzone?.addEventListener('click', (e) => {
+  // dropzone 클릭 핸들러로 인해 PDF 탐색기까지 같이 뜨는 것을 방지합니다.
+  e.stopPropagation();
+  pdfProjectFileInput?.click();
+});
 
 dropzone.addEventListener('dragover', (e) => {
   e.preventDefault();
@@ -2639,7 +2646,6 @@ function loadImage(src) {
 btnExportPdf.addEventListener('click', async () => {
   if (pageList.length === 0) return;
 
-  showExportToast('PDF 생성 중...');
   try {
     const suggestedName = originalFileName || 'edited_document.pdf';
     let fileHandle: FileSystemFileHandle | null = null;
@@ -2662,6 +2668,11 @@ btnExportPdf.addEventListener('click', async () => {
         }
         throw err;
       }
+      // 저장 위치 선택이 끝난 뒤에만 PDF 생성 UI를 보여줍니다.
+      showExportToast('PDF 생성 중...');
+    } else {
+      // File System Access API가 없으면 바로 다운로드 플로우로 진행합니다.
+      showExportToast('PDF 생성 중...');
     }
 
     // OOM 방지: 모든 페이지를 한 PDF에 누적 임베딩하지 않고,
