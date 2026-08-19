@@ -1,11 +1,20 @@
 // @ts-nocheck
 import * as pdfjsLib from 'pdfjs-dist';
 import { PDFDocument } from 'pdf-lib';
+import {
+  clearEditorSession,
+  loadEditorSession,
+  saveEditorPdfRecord,
+  saveEditorStateRecord,
+  savePageAssetsIncremental,
+} from '@/editor-session-store.ts';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url).toString();
 
 /* State Management */
 let pdfDoc = null;
+let pdfSourceData = null;
+let sourceFileName = '';
 let originalFileName = 'edited_document.pdf';
 let currentRenderTask = null;
 
@@ -37,6 +46,15 @@ let pageRenderToastEl = null;
 let pageRenderToastTimer = null;
 let exportToastEl = null;
 let pageInputDebounceTimer = null;
+let sessionSaveTimer = null;
+let sessionSaveInFlight = null;
+let pdfSessionDirty = false;
+let sessionNeedsSave = false;
+const SESSION_SAVE_DELAY_MS = 500;
+const PAGE_INDEX_CACHE_PREFIX = 'pdf-editor-page-index:';
+const PAGE_IMAGE_STORAGE_MAX_WIDTH = 1200;
+const PAGE_IMAGE_STORAGE_QUALITY = 0.82;
+const PAGE_IMAGE_STORAGE_RENDER_SCALE = 1.25;
 
 /* DOM Elements */
 const pdfFileInput = document.getElementById('pdfFileInput');
@@ -109,21 +127,49 @@ pdfFileInput.addEventListener('change', (e) => {
 async function loadPdfFile(file) {
   showLoading('PDF 파일을 읽는 중...', '문서 구조를 분석하고 있습니다.');
   try {
-    originalFileName = file.name.replace('.pdf', '') + '_edited.pdf';
-    docName.textContent = file.name;
-
-    clearPdfCaches();
-
     const arrayBuffer = await file.arrayBuffer();
-    const pdfData = new Uint8Array(arrayBuffer);
+    await openPdfDocument(arrayBuffer, {
+      displayName: file.name,
+      exportName: file.name.replace(/\.pdf$/i, '') + '_edited.pdf',
+    });
+    showToast('PDF 파일을 성공적으로 불러왔습니다.', 'success');
+  } catch (error) {
+    console.error('PDF Load Error:', error);
+    showToast('PDF 파일을 읽는데 실패했습니다.', 'error');
+  } finally {
+    hideLoading();
+  }
+}
 
-    pdfDoc = await pdfjsLib.getDocument({
-      data: pdfData,
-      disableAutoFetch: true,
-      disableFontFace: true,
-      verbosity: 0,
-    }).promise;
+async function openPdfDocument(arrayBuffer, {
+  displayName,
+  exportName,
+  restoredPageList = null,
+  restoredPageIndex = 0,
+  skipSessionSave = false,
+} = {}) {
+  sourceFileName = displayName;
+  originalFileName = exportName;
+  docName.textContent = displayName;
 
+  clearPdfCaches();
+  pdfSessionDirty = true;
+
+  const loadedBytes = toUint8Array(arrayBuffer);
+
+  // Keep an independent copy for IndexedDB; pdf.js may detach the buffer it receives.
+  pdfSourceData = loadedBytes.slice();
+  pdfDoc = await pdfjsLib.getDocument({
+    data: loadedBytes.slice(),
+    disableAutoFetch: true,
+    disableFontFace: true,
+    verbosity: 0,
+  }).promise;
+
+  if (restoredPageList && restoredPageList.length > 0) {
+    pageList = normalizePageList(restoredPageList);
+    currentPageIndex = clampPageIndex(restoredPageIndex, pageList.length);
+  } else {
     pageList = Array.from({ length: pdfDoc.numPages }, (_, i) => ({
       id: 'page_' + Date.now() + '_' + (i + 1),
       originalPageIndex: i + 1,
@@ -131,27 +177,307 @@ async function loadPdfFile(file) {
       crop: null,
       customImageDataUrl: null,
     }));
-
     currentPageIndex = 0;
-    dropzone.classList.add('hidden');
-    canvasWrapper.classList.remove('hidden');
-    editorToolbar.classList.remove('hidden');
+  }
 
-    btnExportPdf.disabled = false;
-    btnExportPdf.classList.remove('opacity-50', 'cursor-not-allowed');
-    btnCopyClipboard.disabled = false;
-    btnCopyClipboard.classList.remove('opacity-50', 'cursor-not-allowed');
+  dropzone.classList.add('hidden');
+  canvasWrapper.classList.remove('hidden');
+  editorToolbar.classList.remove('hidden');
 
-    renderSidebarThumbnails();
+  btnExportPdf.disabled = false;
+  btnExportPdf.classList.remove('opacity-50', 'cursor-not-allowed');
+  btnCopyClipboard.disabled = false;
+  btnCopyClipboard.classList.remove('opacity-50', 'cursor-not-allowed');
 
-    hideLoading();
+  renderSidebarThumbnails();
 
-    await getPdfPageCached(pageList[0].originalPageIndex);
-    await renderCurrentPage();
-    showToast('PDF 파일을 성공적으로 불러왔습니다.', 'success');
+  const firstOriginalPage = pageList.find((page) => page.originalPageIndex != null);
+  if (firstOriginalPage) {
+    await getPdfPageCached(firstOriginalPage.originalPageIndex);
+  }
+
+  await renderCurrentPage();
+  syncCurrentPageIndexCache();
+  if (!skipSessionSave) {
+    markSessionDirty({ pdf: true, immediate: true });
+  }
+}
+
+function toUint8Array(data) {
+  if (data instanceof Uint8Array) {
+    return data.slice();
+  }
+  if (data instanceof ArrayBuffer) {
+    return new Uint8Array(data);
+  }
+  return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+}
+
+function normalizePageList(pages) {
+  return pages.map((page, index) => ({
+    id: page.id || `page_restored_${index + 1}`,
+    originalPageIndex: page.originalPageIndex ?? null,
+    rotation: typeof page.rotation === 'number' ? page.rotation : 0,
+    crop: page.crop ?? null,
+    customImageDataUrl: page.customImageDataUrl ?? null,
+  }));
+}
+
+function downscaleCanvas(canvas, maxWidth = PAGE_IMAGE_STORAGE_MAX_WIDTH) {
+  if (canvas.width <= maxWidth) return canvas;
+
+  const scale = maxWidth / canvas.width;
+  const scaled = document.createElement('canvas');
+  scaled.width = Math.max(1, Math.round(canvas.width * scale));
+  scaled.height = Math.max(1, Math.round(canvas.height * scale));
+  scaled.getContext('2d').drawImage(canvas, 0, 0, scaled.width, scaled.height);
+  return scaled;
+}
+
+function canvasToStorageDataUrl(canvas) {
+  return downscaleCanvas(canvas).toDataURL('image/jpeg', PAGE_IMAGE_STORAGE_QUALITY);
+}
+
+function hydratePageListFromSession(pages, pageAssets = new Map()) {
+  return pages.map((page, index) => {
+    const id = page.id || `page_restored_${index + 1}`;
+    let customImageDataUrl = null;
+
+    if (typeof page.customImageDataUrl === 'string' && page.customImageDataUrl) {
+      customImageDataUrl = page.customImageDataUrl;
+    } else if (page.hasCustomImage && pageAssets.has(id)) {
+      customImageDataUrl = pageAssets.get(id);
+    }
+
+    return {
+      id,
+      originalPageIndex: page.originalPageIndex ?? null,
+      rotation: typeof page.rotation === 'number' ? page.rotation : 0,
+      crop: page.crop ?? null,
+      customImageDataUrl,
+    };
+  });
+}
+
+function getPageIndexCacheKey(fileName = sourceFileName) {
+  return `${PAGE_INDEX_CACHE_PREFIX}${fileName || 'unknown'}`;
+}
+
+function syncCurrentPageIndexCache() {
+  if (pageList.length === 0 || currentPageIndex < 0) return;
+
+  try {
+    sessionStorage.setItem(getPageIndexCacheKey(), String(currentPageIndex));
+  } catch (_error) {}
+}
+
+function readCurrentPageIndexCache(fileName) {
+  try {
+    const raw = sessionStorage.getItem(getPageIndexCacheKey(fileName));
+    if (raw == null) return null;
+    const index = parseInt(raw, 10);
+    return Number.isNaN(index) ? null : index;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function clampPageIndex(index, pageCount) {
+  if (pageCount <= 0) return 0;
+  return Math.max(0, Math.min(index, pageCount - 1));
+}
+
+function resolveRestoredPageIndex(storedIndex, fileName, pageCount) {
+  const idbIndex = clampPageIndex(
+    typeof storedIndex === 'number' ? storedIndex : 0,
+    pageCount
+  );
+  const cachedIndex = readCurrentPageIndexCache(fileName);
+  if (cachedIndex == null) return idbIndex;
+
+  const cached = clampPageIndex(cachedIndex, pageCount);
+  if (idbIndex === cached) return idbIndex;
+  if (idbIndex === 0 && cached > 0) return cached;
+
+  return idbIndex;
+}
+
+function notifyPageIndexChanged() {
+  syncCurrentPageIndexCache();
+  markSessionDirty({ immediate: true });
+}
+
+function buildStateSnapshot({ externalizeImages = false } = {}) {
+  if (pageList.length === 0) return null;
+
+  const safePageIndex = clampPageIndex(currentPageIndex, pageList.length);
+
+  return {
+    pageList: pageList.map((page) => ({
+      id: page.id,
+      originalPageIndex: page.originalPageIndex ?? null,
+      rotation: typeof page.rotation === 'number' ? page.rotation : 0,
+      crop: page.crop ?? null,
+      customImageDataUrl: externalizeImages ? null : (page.customImageDataUrl || null),
+      hasCustomImage: Boolean(page.customImageDataUrl),
+    })),
+    currentPageIndex: safePageIndex,
+    savedAt: Date.now(),
+  };
+}
+
+function buildPdfSnapshot() {
+  if (!pdfSourceData || pdfSourceData.byteLength === 0) return null;
+
+  try {
+    return {
+      sourceFileName,
+      originalFileName,
+      pdfData: pdfSourceData.slice(),
+    };
   } catch (error) {
-    console.error('PDF Load Error:', error);
-    showToast('PDF 파일을 읽는데 실패했습니다.', 'error');
+    console.error('PDF source buffer unavailable for session save:', error);
+    return null;
+  }
+}
+
+function markSessionDirty({ pdf = false, immediate = false } = {}) {
+  if (pdf) pdfSessionDirty = true;
+  sessionNeedsSave = true;
+
+  if (immediate) {
+    if (sessionSaveTimer) {
+      clearTimeout(sessionSaveTimer);
+      sessionSaveTimer = null;
+    }
+    void persistSessionNow();
+    return;
+  }
+
+  if (sessionSaveTimer) clearTimeout(sessionSaveTimer);
+
+  sessionSaveTimer = setTimeout(() => {
+    sessionSaveTimer = null;
+    void persistSessionNow();
+  }, SESSION_SAVE_DELAY_MS);
+}
+
+async function persistSessionNow() {
+  sessionNeedsSave = true;
+
+  if (sessionSaveInFlight) {
+    await sessionSaveInFlight;
+  }
+
+  sessionSaveInFlight = flushSessionSave();
+  try {
+    await sessionSaveInFlight;
+  } finally {
+    sessionSaveInFlight = null;
+  }
+
+  if (sessionNeedsSave) {
+    await persistSessionNow();
+  }
+}
+
+async function flushSessionSave() {
+  do {
+    sessionNeedsSave = false;
+
+    const inlineSnapshot = buildStateSnapshot();
+    if (!inlineSnapshot) {
+      try {
+        await clearEditorSession();
+      } catch (error) {
+        console.error('Session clear failed:', error);
+      }
+      return;
+    }
+
+    const assets = pageList
+      .filter((page) => page.customImageDataUrl)
+      .map((page) => ({
+        id: page.id,
+        imageDataUrl: page.customImageDataUrl,
+        updatedAt: Date.now(),
+      }));
+
+    try {
+      if (pdfSessionDirty) {
+        const pdfSnapshot = buildPdfSnapshot();
+        if (pdfSnapshot) {
+          await saveEditorPdfRecord(pdfSnapshot);
+          pdfSessionDirty = false;
+        }
+      }
+
+      syncCurrentPageIndexCache();
+
+      try {
+        await saveEditorStateRecord(inlineSnapshot);
+      } catch (error) {
+        if (error?.name !== 'QuotaExceededError') throw error;
+
+        await savePageAssetsIncremental(assets);
+        await saveEditorStateRecord(buildStateSnapshot({ externalizeImages: true }));
+      }
+    } catch (error) {
+      sessionNeedsSave = true;
+      console.error('Session save failed:', error);
+      if (error?.name === 'QuotaExceededError') {
+        showToast('저장 공간이 부족해 작업 내용을 저장하지 못했습니다.', 'error');
+      }
+      throw error;
+    }
+  } while (sessionNeedsSave);
+}
+
+async function restoreEditorSession() {
+  let session;
+  try {
+    session = await loadEditorSession();
+  } catch (error) {
+    console.error('Session load failed:', error);
+    return false;
+  }
+
+  if (!session?.pdfData || !Array.isArray(session.pageList) || session.pageList.length === 0) {
+    return false;
+  }
+
+  showLoading('이전 작업 복원 중...', '저장된 PDF와 편집 내용을 불러오고 있습니다.');
+  try {
+    const hydratedPageList = hydratePageListFromSession(
+      session.pageList,
+      session.pageAssets ?? new Map()
+    );
+    const restoredPageIndex = resolveRestoredPageIndex(
+      session.currentPageIndex,
+      session.sourceFileName,
+      hydratedPageList.length
+    );
+
+    await openPdfDocument(session.pdfData, {
+      displayName: session.sourceFileName || 'Restored document.pdf',
+      exportName: session.originalFileName || 'edited_document.pdf',
+      restoredPageList: hydratedPageList,
+      restoredPageIndex,
+      skipSessionSave: true,
+    });
+    pdfSessionDirty = false;
+    syncCurrentPageIndexCache();
+    showToast('이전 작업을 자동으로 복원했습니다.', 'info');
+    return true;
+  } catch (error) {
+    console.error('Session restore failed:', error);
+    try {
+      await clearEditorSession();
+    } catch (clearError) {
+      console.error('Session clear after restore failure failed:', clearError);
+    }
+    showToast('이전 작업 복원에 실패했습니다.', 'error');
+    return false;
   } finally {
     hideLoading();
   }
@@ -392,8 +718,10 @@ function createThumbCard(index) {
 
   thumbCard.addEventListener('click', () => {
     clearPageInputDebounce();
+    if (currentPageIndex === index) return;
     currentPageIndex = index;
     renderCurrentPage();
+    notifyPageIndexChanged();
   });
 
   return thumbCard;
@@ -568,6 +896,7 @@ function setPageRotation(deg) {
   applyCanvasRotation(normDeg);
   updateSidebarThumbnailRotation(currentPageIndex, normDeg);
   updateApplyRotationButtonVisibility(normDeg);
+  markSessionDirty();
 }
 
 function updateApplyRotationButtonVisibility(deg) {
@@ -798,6 +1127,7 @@ btnAddCroppedPage.addEventListener('click', async () => {
 
     await renderSidebarThumbnails();
     await renderCurrentPage();
+    await persistSessionNow();
     showToast('새 크롭 페이지가 추가되었습니다!', 'success');
   } catch (err) {
     console.error(err);
@@ -827,6 +1157,7 @@ btnApplyCropToPage.addEventListener('click', async () => {
 
     await renderSidebarThumbnails();
     await renderCurrentPage();
+    await persistSessionNow();
     showToast('크롭이 현재 페이지에 적용되었습니다.', 'success');
   } catch (err) {
     console.error(err);
@@ -844,8 +1175,8 @@ async function applyRotationToCurrentPage() {
 
   showLoading('회전 적용 중...', '현재 페이지에 회전을 반영하고 있습니다.');
   try {
-    const canvas = await renderPageToCanvas(item, 2.0);
-    const dataUrl = canvas.toDataURL('image/png');
+    const canvas = await renderPageToCanvas(item, PAGE_IMAGE_STORAGE_RENDER_SCALE);
+    const dataUrl = canvasToStorageDataUrl(canvas);
 
     pageList[currentPageIndex] = {
       ...item,
@@ -857,6 +1188,7 @@ async function applyRotationToCurrentPage() {
 
     await renderSidebarThumbnails();
     await renderCurrentPage();
+    await persistSessionNow();
     showToast('회전이 현재 페이지에 적용되었습니다.', 'success');
   } catch (err) {
     console.error(err);
@@ -893,7 +1225,7 @@ async function generateCroppedImageDataUrl() {
     0, 0, cropW, cropH
   );
 
-  return offCanvas.toDataURL('image/png');
+  return canvasToStorageDataUrl(offCanvas);
 }
 
 btnDeleteCurrentPage.addEventListener('click', () => {
@@ -913,6 +1245,7 @@ function deletePage(index) {
 
   renderSidebarThumbnails();
   renderCurrentPage();
+  notifyPageIndexChanged();
   showToast('Page deleted.', 'info');
 }
 
@@ -923,6 +1256,7 @@ function movePage(fromIndex, toIndex) {
   currentPageIndex = toIndex;
   renderSidebarThumbnails();
   renderCurrentPage();
+  notifyPageIndexChanged();
 }
 
 function goToPrevPage() {
@@ -930,6 +1264,7 @@ function goToPrevPage() {
   if (currentPageIndex > 0) {
     currentPageIndex--;
     renderCurrentPage();
+    notifyPageIndexChanged();
   }
 }
 
@@ -938,6 +1273,7 @@ function goToNextPage() {
   if (currentPageIndex < pageList.length - 1) {
     currentPageIndex++;
     renderCurrentPage();
+    notifyPageIndexChanged();
   }
 }
 
@@ -958,6 +1294,7 @@ function goToPageByNumber(pageNum) {
 
   currentPageIndex = targetIndex;
   renderCurrentPage();
+  notifyPageIndexChanged();
 }
 
 function clearPageInputDebounce() {
@@ -1272,7 +1609,42 @@ function hideLoading() {
   loadingOverlay.classList.add('hidden');
 }
 
-export function initPdfPageEditor() {
-  // All event listeners are registered above at module scope.
-  // This function exists as the module entry point called from main.ts.
+function hasLoadedPdf() {
+  return pageList.length > 0;
+}
+
+function handleBeforeUnload(event) {
+  if (!hasLoadedPdf()) return;
+
+  if (sessionSaveTimer) {
+    clearTimeout(sessionSaveTimer);
+    sessionSaveTimer = null;
+  }
+  void persistSessionNow();
+
+  event.preventDefault();
+  event.returnValue = '';
+}
+
+export async function initPdfPageEditor() {
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'hidden') return;
+    if (sessionSaveTimer) {
+      clearTimeout(sessionSaveTimer);
+      sessionSaveTimer = null;
+    }
+    void persistSessionNow();
+  });
+
+  window.addEventListener('pagehide', () => {
+    if (sessionSaveTimer) {
+      clearTimeout(sessionSaveTimer);
+      sessionSaveTimer = null;
+    }
+    void persistSessionNow();
+  });
+
+  window.addEventListener('beforeunload', handleBeforeUnload);
+
+  await restoreEditorSession();
 }

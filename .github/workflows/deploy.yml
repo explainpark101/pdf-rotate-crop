@@ -31,7 +31,6 @@ jobs:
       - name: Install dependencies
         run: |
           bun install
-          bun install --cwd docs
 
       - name: Build
         run: bun run build
@@ -47,12 +46,6 @@ jobs:
             echo "✓ index.html found"
           else
             echo "✗ index.html not found. build failed"
-            exit 1
-          fi
-          if [ -f "dist/docs/index.html" ]; then
-            echo "✓ docs/index.html found"
-          else
-            echo "✗ docs/index.html not found. VitePress build failed"
             exit 1
           fi
 
