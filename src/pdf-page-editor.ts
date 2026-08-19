@@ -45,6 +45,39 @@ let pageHistoryBaselineMap = new Map(); // pageId -> snapshot
 let isRestoredSession = false;
 let trustedBaselinePageIds = new Set(); // DB에 baseline이 있는 페이지(또는 새로 생성된 페이지)
 
+// Blob 기반 이미지 렌더링을 위해 생성하는 objectURL들을 추적/정리합니다.
+const objectUrlRegistry = new Set();
+function registerObjectUrl(url) {
+  if (typeof url === 'string' && url.startsWith('blob:')) {
+    objectUrlRegistry.add(url);
+  }
+}
+function revokeRegisteredObjectUrls() {
+  for (const url of objectUrlRegistry) {
+    try {
+      URL.revokeObjectURL(url);
+    } catch (_e) {}
+  }
+  objectUrlRegistry.clear();
+}
+
+function dataUrlToBlob(dataUrl) {
+  if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:')) return null;
+  const parts = dataUrl.split(',');
+  if (parts.length < 2) return null;
+  const meta = parts[0];
+  const b64 = parts[1];
+
+  const mimeMatch = /data:(.*?);base64/i.exec(meta);
+  const mime = mimeMatch?.[1] || 'application/octet-stream';
+
+  const binStr = atob(b64);
+  const len = binStr.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) bytes[i] = binStr.charCodeAt(i);
+  return new Blob([bytes], { type: mime });
+}
+
 let isCropMode = false;
 let cropBox = { x: 0.1, y: 0.1, w: 0.8, h: 0.8 };
 let cropBoxDraftSnapshot = null; // crop 모드 진입 시점의 박스(변경 여부 판단용)
@@ -628,11 +661,19 @@ function hydratePageListFromSession(pages, pageAssets = new Map()) {
   return pages.map((page, index) => {
     const id = page.id || `page_restored_${index + 1}`;
     let customImageDataUrl = null;
+    let customImageBlob = null;
 
     if (typeof page.customImageDataUrl === 'string' && page.customImageDataUrl) {
       customImageDataUrl = page.customImageDataUrl;
     } else if (page.hasCustomImage && pageAssets.has(id)) {
-      customImageDataUrl = pageAssets.get(id);
+      const assetVal = pageAssets.get(id);
+      if (assetVal instanceof Blob) {
+        customImageBlob = assetVal;
+        customImageDataUrl = URL.createObjectURL(assetVal);
+        registerObjectUrl(customImageDataUrl);
+      } else {
+        customImageDataUrl = assetVal;
+      }
     }
 
     return {
@@ -641,6 +682,7 @@ function hydratePageListFromSession(pages, pageAssets = new Map()) {
       rotation: typeof page.rotation === 'number' ? page.rotation : 0,
       crop: page.crop ?? null,
       customImageDataUrl,
+      customImageBlob,
     };
   });
 }
@@ -682,7 +724,7 @@ function takePageSnapshot(page) {
     originalPageIndex: page.originalPageIndex ?? null,
     rotation: typeof page.rotation === 'number' ? page.rotation : 0,
     crop: page.crop ?? null,
-    customImageDataUrl: page.customImageDataUrl ?? null,
+    customImageBlob: page.customImageBlob ?? dataUrlToBlob(page.customImageDataUrl) ?? null,
   };
 }
 
@@ -691,7 +733,37 @@ function applySnapshotToPage(page, snapshot) {
   if ('originalPageIndex' in snapshot) page.originalPageIndex = snapshot.originalPageIndex ?? null;
   if ('rotation' in snapshot) page.rotation = typeof snapshot.rotation === 'number' ? snapshot.rotation : 0;
   if ('crop' in snapshot) page.crop = snapshot.crop ?? null;
-  if ('customImageDataUrl' in snapshot) page.customImageDataUrl = snapshot.customImageDataUrl ?? null;
+
+  // blob: URL은 revoke하지 않으면 세션 동안 누적될 수 있어, 교체 전에 이전 값을 정리합니다.
+  const prevUrl = page.customImageDataUrl;
+  if (prevUrl && typeof prevUrl === 'string' && prevUrl.startsWith('blob:')) {
+    objectUrlRegistry.delete(prevUrl);
+    try {
+      URL.revokeObjectURL(prevUrl);
+    } catch (_e) {}
+  }
+
+  if ('customImageBlob' in snapshot) {
+    page.customImageBlob = snapshot.customImageBlob ?? null;
+    if (page.customImageBlob) {
+      const url = URL.createObjectURL(page.customImageBlob);
+      registerObjectUrl(url);
+      page.customImageDataUrl = url;
+    } else {
+      page.customImageDataUrl = null;
+    }
+  } else if ('customImageDataUrl' in snapshot) {
+    // 레거시 히스토리(기존 저장 포맷) 호환: dataURL이 들어오면 Blob으로 변환합니다.
+    page.customImageDataUrl = snapshot.customImageDataUrl ?? null;
+    page.customImageBlob = page.customImageDataUrl
+      ? dataUrlToBlob(page.customImageDataUrl) ?? null
+      : null;
+    if (page.customImageBlob) {
+      const url = URL.createObjectURL(page.customImageBlob);
+      registerObjectUrl(url);
+      page.customImageDataUrl = url;
+    }
+  }
 }
 
 function updateUndoRedoButtons() {
@@ -870,7 +942,7 @@ function buildStateSnapshot({ externalizeImages = false } = {}) {
       rotation: typeof page.rotation === 'number' ? page.rotation : 0,
       crop: page.crop ?? null,
       customImageDataUrl: externalizeImages ? null : (page.customImageDataUrl || null),
-      hasCustomImage: Boolean(page.customImageDataUrl),
+      hasCustomImage: Boolean(page.customImageDataUrl || page.customImageBlob),
     })),
     currentPageIndex: safePageIndex,
     savedAt: Date.now(),
@@ -936,7 +1008,7 @@ async function flushSessionSave() {
   do {
     sessionNeedsSave = false;
 
-    const inlineSnapshot = buildStateSnapshot();
+    const inlineSnapshot = buildStateSnapshot({ externalizeImages: true });
     if (!inlineSnapshot) {
       try {
         await clearEditorSession();
@@ -947,12 +1019,18 @@ async function flushSessionSave() {
     }
 
     const assets = pageList
-      .filter((page) => page.customImageDataUrl)
-      .map((page) => ({
-        id: page.id,
-        imageDataUrl: page.customImageDataUrl,
-        updatedAt: Date.now(),
-      }));
+      .filter((page) => page.customImageDataUrl || page.customImageBlob)
+      .map((page) => {
+        const blob = page.customImageBlob ?? dataUrlToBlob(page.customImageDataUrl);
+        return blob
+          ? {
+              id: page.id,
+              imageBlob: blob,
+              updatedAt: Date.now(),
+            }
+          : null;
+      })
+      .filter(Boolean);
 
     try {
       if (pdfSessionDirty) {
@@ -1009,6 +1087,26 @@ async function restoreEditorSession() {
     const restoredPageHistoryPointers = session.pageHistoryPointers ?? new Map();
     const restoredPageHistoryBaselines = session.pageHistoryBaselines ?? new Map();
 
+    // 레거시 포맷 마이그레이션: 히스토리 스냅샷에 남아있는 customImageDataUrl을 Blob 기반으로 변환합니다.
+    const migrateSnapshotCustomImage = (snapshot) => {
+      if (!snapshot || typeof snapshot !== 'object') return;
+      if (!('customImageDataUrl' in snapshot)) return;
+
+      const dataUrl = snapshot.customImageDataUrl ?? null;
+      delete snapshot.customImageDataUrl;
+      snapshot.customImageBlob = dataUrl ? dataUrlToBlob(dataUrl) ?? null : null;
+    };
+
+    for (const [_pageId, events] of restoredPageHistories) {
+      if (!Array.isArray(events)) continue;
+      for (const ev of events) {
+        if (ev?.snapshot) migrateSnapshotCustomImage(ev.snapshot);
+      }
+    }
+    for (const [_pageId, baseSnap] of restoredPageHistoryBaselines) {
+      migrateSnapshotCustomImage(baseSnap);
+    }
+
     isRestoredSession = true;
     trustedBaselinePageIds = new Set(restoredPageHistoryBaselines.keys());
 
@@ -1049,6 +1147,8 @@ async function restoreEditorSession() {
     });
     pdfSessionDirty = false;
     syncCurrentPageIndexCache();
+    // 마이그레이션된 히스토리 포맷(Blob 기반)을 IndexedDB에 다시 저장합니다.
+    await persistSessionNow();
     showToast('이전 작업을 자동으로 복원했습니다.', 'info');
     return true;
   } catch (error) {
@@ -1087,6 +1187,8 @@ function resetEditorToNoProject() {
   try {
     if (isCropMode) exitCropModeInternal({ revertDraft: false });
   } catch (_e) {}
+
+  revokeRegisteredObjectUrls();
 
   // 메모리/상태만 비우고, IndexedDB는 건드리지 않습니다.
   pdfDoc = null;
@@ -1966,13 +2068,15 @@ btnAddCroppedPage.addEventListener('click', async () => {
   showLoading('크롭 영역 추출 중...', '선택한 영역을 새 페이지로 생성하고 있습니다.');
   try {
     const croppedDataUrl = await generateCroppedImageDataUrl();
+    const croppedBlob = dataUrlToBlob(croppedDataUrl);
 
     const newPageItem = {
       id: 'page_crop_' + Date.now(),
       originalPageIndex: null,
       rotation: 0,
       crop: null,
-      customImageDataUrl: croppedDataUrl
+      customImageDataUrl: croppedDataUrl,
+      customImageBlob: croppedBlob,
     };
 
     pageList.splice(currentPageIndex + 1, 0, newPageItem);
@@ -1990,7 +2094,7 @@ btnAddCroppedPage.addEventListener('click', async () => {
         originalPageIndex: null,
         rotation: 0,
         crop: null,
-        customImageDataUrl: croppedDataUrl,
+        customImageBlob: croppedBlob,
       },
     });
 
@@ -2014,6 +2118,7 @@ btnApplyCropToPage.addEventListener('click', async () => {
   showLoading('크롭 적용 중...', '선택한 영역을 현재 페이지에 반영하고 있습니다.');
   try {
     const croppedDataUrl = await generateCroppedImageDataUrl();
+    const croppedBlob = dataUrlToBlob(croppedDataUrl);
     const currentItem = pageList[currentPageIndex];
     const pageId = currentItem.id;
 
@@ -2022,7 +2127,8 @@ btnApplyCropToPage.addEventListener('click', async () => {
       originalPageIndex: null,
       rotation: 0,
       crop: null,
-      customImageDataUrl: croppedDataUrl
+      customImageDataUrl: croppedDataUrl,
+      customImageBlob: croppedBlob,
     };
 
     await commitPageHistoryEvent(pageId, {
@@ -2032,7 +2138,7 @@ btnApplyCropToPage.addEventListener('click', async () => {
         originalPageIndex: null,
         rotation: 0,
         crop: null,
-        customImageDataUrl: croppedDataUrl,
+        customImageBlob: croppedBlob,
       },
     });
 
@@ -2061,13 +2167,15 @@ async function applyRotationToCurrentPage() {
   try {
     const canvas = await renderPageToCanvas(item, PAGE_IMAGE_STORAGE_RENDER_SCALE);
     const dataUrl = canvasToStorageDataUrl(canvas);
+    const blob = dataUrlToBlob(dataUrl);
 
     pageList[currentPageIndex] = {
       ...item,
       originalPageIndex: null,
       rotation: 0,
       crop: null,
-      customImageDataUrl: dataUrl
+      customImageDataUrl: dataUrl,
+      customImageBlob: blob,
     };
 
     await commitPageHistoryEvent(pageId, {
@@ -2077,7 +2185,7 @@ async function applyRotationToCurrentPage() {
         originalPageIndex: null,
         rotation: 0,
         crop: null,
-        customImageDataUrl: dataUrl,
+        customImageBlob: blob,
       },
     });
 

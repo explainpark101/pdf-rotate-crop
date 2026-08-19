@@ -139,7 +139,8 @@ function putPageAsset(asset) {
   return runWriteTransaction([PAGE_ASSETS_STORE], ([store]) => {
     store.put({
       id: asset.id,
-      imageDataUrl: asset.imageDataUrl,
+      imageBlob: asset.imageBlob ?? null,
+      imageDataUrl: asset.imageDataUrl ?? null, // legacy fallback
       updatedAt: asset.updatedAt ?? Date.now(),
     });
   });
@@ -192,7 +193,10 @@ export function loadPageAssets() {
         const map = new Map();
         for (const record of request.result ?? []) {
           if (!record?.id) continue;
-          if (typeof record.imageDataUrl === 'string' && record.imageDataUrl) {
+          if (record.imageBlob instanceof Blob) {
+            map.set(record.id, record.imageBlob);
+          } else if (typeof record.imageDataUrl === 'string' && record.imageDataUrl) {
+            // legacy sessions
             map.set(record.id, record.imageDataUrl);
           }
         }
