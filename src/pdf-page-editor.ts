@@ -28,9 +28,15 @@ let activeHandle = null;
 let dragStartX = 0, dragStartY = 0;
 let cropStartBox = null;
 let renderSeq = 0;
+
+const CROP_PRESETS = {
+  leftHalf: { x: 0, y: 0, w: 0.5, h: 1 },
+  center80: { x: 0.1, y: 0.1, w: 0.8, h: 0.8 },
+};
 let pageRenderToastEl = null;
 let pageRenderToastTimer = null;
 let exportToastEl = null;
+let pageInputDebounceTimer = null;
 
 /* DOM Elements */
 const pdfFileInput = document.getElementById('pdfFileInput');
@@ -59,6 +65,7 @@ const btnResetRotate = document.getElementById('btnResetRotate');
 const btnApplyRotationToPage = document.getElementById('btnApplyRotationToPage');
 const btnToggleCrop = document.getElementById('btnToggleCrop');
 const cropBtnText = document.getElementById('cropBtnText');
+const cropPresetGroup = document.getElementById('cropPresetGroup');
 const btnApplyCropToPage = document.getElementById('btnApplyCropToPage');
 const btnAddCroppedPage = document.getElementById('btnAddCroppedPage');
 const btnDeleteCurrentPage = document.getElementById('btnDeleteCurrentPage');
@@ -195,7 +202,11 @@ async function renderCurrentPage() {
 
   const item = pageList[currentPageIndex];
 
-  currentPageNum.textContent = currentPageIndex + 1;
+  currentPageNum.max = pageList.length;
+  if (document.activeElement !== currentPageNum) {
+    currentPageNum.value = currentPageIndex + 1;
+  }
+  currentPageNum.disabled = false;
   totalPagesNum.textContent = pageList.length;
   pageCount.textContent = pageList.length;
   btnPrevPage.disabled = currentPageIndex === 0;
@@ -380,6 +391,7 @@ function createThumbCard(index) {
   thumbCard.appendChild(infoBar);
 
   thumbCard.addEventListener('click', () => {
+    clearPageInputDebounce();
     currentPageIndex = index;
     renderCurrentPage();
   });
@@ -634,24 +646,51 @@ function updateSidebarThumbnailRotation(index, deg) {
 btnToggleCrop.addEventListener('click', () => {
   isCropMode = !isCropMode;
   if (isCropMode) {
-    btnToggleCrop.classList.replace('bg-slate-100', 'bg-slate-600');
+    btnToggleCrop.classList.replace('bg-slate-100', 'bg-slate-300');
     btnToggleCrop.classList.replace('hover:bg-blue-50', 'hover:bg-slate-500');
     btnToggleCrop.classList.replace('text-slate-700', 'text-white');
     cropBtnText.textContent = 'Cancel Crop';
     cropOverlay.classList.remove('hidden');
+    cropPresetGroup.classList.remove('hidden');
+    cropPresetGroup.classList.add('flex');
     btnApplyCropToPage.classList.remove('hidden');
     btnAddCroppedPage.classList.remove('hidden');
-    cropBox = { x: 0.1, y: 0.1, w: 0.8, h: 0.8 };
-    updateCropOverlayPosition();
+    applyCropPreset('center80');
   } else {
     btnToggleCrop.classList.replace('bg-slate-600', 'bg-slate-100');
     btnToggleCrop.classList.replace('hover:bg-slate-500', 'hover:bg-blue-50');
     btnToggleCrop.classList.replace('text-white', 'text-slate-700');
     cropBtnText.textContent = '영역 크롭 모드';
     cropOverlay.classList.add('hidden');
+    cropPresetGroup.classList.add('hidden');
+    cropPresetGroup.classList.remove('flex');
     btnApplyCropToPage.classList.add('hidden');
     btnAddCroppedPage.classList.add('hidden');
   }
+});
+
+function applyCropPreset(presetKey) {
+  const preset = CROP_PRESETS[presetKey];
+  if (!preset) return;
+
+  cropBox = { ...preset };
+  updateCropOverlayPosition();
+
+  cropPresetGroup.querySelectorAll('[data-crop-preset]').forEach((btn) => {
+    const isActive = btn.dataset.cropPreset === presetKey;
+    btn.classList.toggle('bg-blue-100', isActive);
+    btn.classList.toggle('border-blue-400', isActive);
+    btn.classList.toggle('text-blue-700', isActive);
+    btn.classList.toggle('bg-slate-100', !isActive);
+    btn.classList.toggle('border-slate-200', !isActive);
+    btn.classList.toggle('text-slate-700', !isActive);
+  });
+}
+
+cropPresetGroup.addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-crop-preset]');
+  if (!btn) return;
+  applyCropPreset(btn.dataset.cropPreset);
 });
 
 function updateCropOverlayPosition() {
@@ -887,6 +926,7 @@ function movePage(fromIndex, toIndex) {
 }
 
 function goToPrevPage() {
+  clearPageInputDebounce();
   if (currentPageIndex > 0) {
     currentPageIndex--;
     renderCurrentPage();
@@ -894,6 +934,7 @@ function goToPrevPage() {
 }
 
 function goToNextPage() {
+  clearPageInputDebounce();
   if (currentPageIndex < pageList.length - 1) {
     currentPageIndex++;
     renderCurrentPage();
@@ -906,6 +947,50 @@ function isKeyboardInputTarget(target) {
   return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable;
 }
 
+function goToPageByNumber(pageNum) {
+  if (pageList.length === 0) return;
+
+  const targetIndex = Math.max(1, Math.min(pageList.length, pageNum)) - 1;
+  if (targetIndex === currentPageIndex) {
+    currentPageNum.value = currentPageIndex + 1;
+    return;
+  }
+
+  currentPageIndex = targetIndex;
+  renderCurrentPage();
+}
+
+function clearPageInputDebounce() {
+  if (pageInputDebounceTimer) {
+    clearTimeout(pageInputDebounceTimer);
+    pageInputDebounceTimer = null;
+  }
+}
+
+function schedulePageInputNavigation() {
+  if (pageInputDebounceTimer) clearTimeout(pageInputDebounceTimer);
+
+  pageInputDebounceTimer = setTimeout(() => {
+    pageInputDebounceTimer = null;
+
+    if (pageList.length === 0) return;
+
+    const raw = currentPageNum.value.trim();
+    if (raw === '') {
+      currentPageNum.value = currentPageIndex + 1;
+      return;
+    }
+
+    const pageNum = parseInt(raw, 10);
+    if (Number.isNaN(pageNum)) {
+      currentPageNum.value = currentPageIndex + 1;
+      return;
+    }
+
+    goToPageByNumber(pageNum);
+  }, 500);
+}
+
 btnPrevPage.addEventListener('click', () => {
   goToPrevPage();
 });
@@ -913,6 +998,8 @@ btnPrevPage.addEventListener('click', () => {
 btnNextPage.addEventListener('click', () => {
   goToNextPage();
 });
+
+currentPageNum.addEventListener('input', schedulePageInputNavigation);
 
 document.addEventListener('keydown', (e) => {
   if (isKeyboardInputTarget(e.target)) return;
