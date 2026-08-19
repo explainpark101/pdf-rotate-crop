@@ -114,6 +114,10 @@ const btnRedoPage = document.getElementById('btnRedoPage');
 const btnExportPdf = document.getElementById('btnExportPdf');
 const btnExportProject = document.getElementById('btnExportProject');
 const btnShowShortcuts = document.getElementById('btnShowShortcuts');
+const btnCloseProject = document.getElementById('btnCloseProject');
+const btnDeleteProject = document.getElementById('btnDeleteProject');
+const btnRestoreRecentSession = document.getElementById('btnRestoreRecentSession');
+const btnClearRecentSession = document.getElementById('btnClearRecentSession');
 const btnCopyClipboard = document.getElementById('btnCopyClipboard');
 const loadingOverlay = document.getElementById('loadingOverlay');
 const viewportContainer = document.getElementById('viewportContainer');
@@ -122,6 +126,12 @@ const viewportContainer = document.getElementById('viewportContainer');
 let isShortcutsModalOpen = false;
 let isConfirmCropExitModalOpen = false;
 let confirmCropExitResolve = null;
+
+let isConfirmDeleteProjectModalOpen = false;
+let confirmDeleteProjectResolve = null;
+
+let isConfirmAfterProjectExportModalOpen = false;
+let confirmAfterProjectExportResolve = null;
 
 function openShortcutsModal() {
   const el = document.getElementById('shortcutsModal');
@@ -154,6 +164,42 @@ function closeConfirmCropExitModal() {
   el.classList.add('hidden');
   isConfirmCropExitModalOpen = false;
   confirmCropExitResolve = null;
+}
+
+function openConfirmDeleteProjectModal() {
+  const el = document.getElementById('confirmDeleteProjectModal');
+  if (!el) return Promise.resolve(false);
+  el.classList.remove('hidden');
+  isConfirmDeleteProjectModalOpen = true;
+  return new Promise((resolve) => {
+    confirmDeleteProjectResolve = resolve;
+  });
+}
+
+function closeConfirmDeleteProjectModal() {
+  const el = document.getElementById('confirmDeleteProjectModal');
+  if (!el) return;
+  el.classList.add('hidden');
+  isConfirmDeleteProjectModalOpen = false;
+  confirmDeleteProjectResolve = null;
+}
+
+function openConfirmAfterProjectExportModal() {
+  const el = document.getElementById('confirmAfterProjectExportModal');
+  if (!el) return Promise.resolve(false);
+  el.classList.remove('hidden');
+  isConfirmAfterProjectExportModalOpen = true;
+  return new Promise((resolve) => {
+    confirmAfterProjectExportResolve = resolve;
+  });
+}
+
+function closeConfirmAfterProjectExportModal() {
+  const el = document.getElementById('confirmAfterProjectExportModal');
+  if (!el) return;
+  el.classList.add('hidden');
+  isConfirmAfterProjectExportModalOpen = false;
+  confirmAfterProjectExportResolve = null;
 }
 
 // Create modal DOM once.
@@ -209,6 +255,60 @@ function closeConfirmCropExitModal() {
       closeConfirmCropExitModal();
     });
   }
+
+  if (!document.getElementById('confirmDeleteProjectModal')) {
+    const overlay = document.createElement('div');
+    overlay.id = 'confirmDeleteProjectModal';
+    overlay.className = 'hidden fixed inset-0 bg-black/50 z-[100] flex items-center justify-center px-4';
+    overlay.innerHTML = `
+      <div class="w-full max-w-md bg-white rounded-xl shadow-xl border border-slate-200 p-4">
+        <div class="font-bold text-slate-900 mb-2">프로젝트를 삭제할까요?</div>
+        <div class="text-sm text-slate-700 mb-4">
+          IndexedDB에 저장된 프로젝트(원본 PDF/편집 상태)를 삭제합니다. 되돌릴 수 없습니다.
+        </div>
+        <div class="flex items-center justify-end gap-2">
+          <button id="btnCancelConfirmDeleteProject" class="px-3 py-2 rounded bg-slate-100 hover:bg-slate-200 text-slate-800">취소</button>
+          <button id="btnConfirmConfirmDeleteProject" class="px-3 py-2 rounded bg-rose-600 hover:bg-rose-500 text-white">삭제</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+
+    overlay.querySelector('#btnCancelConfirmDeleteProject')?.addEventListener('click', () => {
+      if (confirmDeleteProjectResolve) confirmDeleteProjectResolve(false);
+      closeConfirmDeleteProjectModal();
+    });
+    overlay.querySelector('#btnConfirmConfirmDeleteProject')?.addEventListener('click', () => {
+      if (confirmDeleteProjectResolve) confirmDeleteProjectResolve(true);
+      closeConfirmDeleteProjectModal();
+    });
+  }
+
+  if (!document.getElementById('confirmAfterProjectExportModal')) {
+    const overlay = document.createElement('div');
+    overlay.id = 'confirmAfterProjectExportModal';
+    overlay.className = 'hidden fixed inset-0 bg-black/50 z-[100] flex items-center justify-center px-4';
+    overlay.innerHTML = `
+      <div class="w-full max-w-md bg-white rounded-xl shadow-xl border border-slate-200 p-4">
+        <div class="font-bold text-slate-900 mb-2">프로젝트를 정리할까요?</div>
+        <div class="text-sm text-slate-700 mb-4">프로젝트 파일 저장 후 IndexedDB 캐시를 삭제하고 현재 프로젝트를 닫을지 확인합니다.</div>
+        <div class="flex items-center justify-end gap-2">
+          <button id="btnCancelConfirmAfterProjectExport" class="px-3 py-2 rounded bg-slate-100 hover:bg-slate-200 text-slate-800">취소</button>
+          <button id="btnConfirmConfirmAfterProjectExport" class="px-3 py-2 rounded bg-blue-600 hover:bg-blue-500 text-white">확인</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+
+    overlay.querySelector('#btnCancelConfirmAfterProjectExport')?.addEventListener('click', () => {
+      if (confirmAfterProjectExportResolve) confirmAfterProjectExportResolve(false);
+      closeConfirmAfterProjectExportModal();
+    });
+    overlay.querySelector('#btnConfirmConfirmAfterProjectExport')?.addEventListener('click', () => {
+      if (confirmAfterProjectExportResolve) confirmAfterProjectExportResolve(true);
+      closeConfirmAfterProjectExportModal();
+    });
+  }
 })();
 
 dropzone.addEventListener('click', () => pdfFileInput.click());
@@ -227,23 +327,35 @@ dropzone.addEventListener('drop', (e) => {
   dropzone.classList.remove('border-blue-500', 'bg-blue-50/50');
   if (e.dataTransfer.files && e.dataTransfer.files[0]) {
     const file = e.dataTransfer.files[0];
-    if (file.type === 'application/pdf') {
+    const lowerName = (file.name || '').toLowerCase();
+    const isPdf = file.type === 'application/pdf' || lowerName.endsWith('.pdf');
+    const isProject = lowerName.endsWith('.pdfedit') || lowerName.endsWith('.pdfedit.gz');
+    if (isPdf) {
       loadPdfFile(file);
+    } else if (isProject) {
+      loadProjectFile(file);
     } else {
-      showToast('PDF files only.', 'error');
+      showToast('PDF 또는 프로젝트(.pdfedit) 파일만 지원합니다.', 'error');
     }
   }
 });
 
 pdfFileInput.addEventListener('change', (e) => {
   if (e.target.files && e.target.files[0]) {
-    loadPdfFile(e.target.files[0]);
+    const file = e.target.files[0];
+    const lowerName = (file.name || '').toLowerCase();
+    const isPdf = file.type === 'application/pdf' || lowerName.endsWith('.pdf');
+    const isProject = lowerName.endsWith('.pdfedit') || lowerName.endsWith('.pdfedit.gz');
+    if (isPdf) loadPdfFile(file);
+    else if (isProject) void loadProjectFile(file);
   }
 });
 
 async function loadPdfFile(file) {
-  showLoading('PDF 파일을 읽는 중...', '문서 구조를 분석하고 있습니다.');
+  showLoading('PDF 파일을 읽는 중...', '기존 IndexedDB를 초기화하고 저장합니다.');
   try {
+    resetEditorToNoProject();
+    await clearEditorSession();
     const arrayBuffer = await file.arrayBuffer();
     await openPdfDocument(arrayBuffer, {
       displayName: file.name,
@@ -253,6 +365,83 @@ async function loadPdfFile(file) {
   } catch (error) {
     console.error('PDF Load Error:', error);
     showToast('PDF 파일을 읽는데 실패했습니다.', 'error');
+  } finally {
+    hideLoading();
+  }
+}
+
+function decodeProjectMagicBytes() {
+  return new TextEncoder().encode('PDFPAGEEDIT\0');
+}
+
+async function ungzipIfNeeded(arrayBuffer, shouldGunzip) {
+  if (!shouldGunzip) return new Uint8Array(arrayBuffer);
+  if (typeof DecompressionStream === 'undefined') {
+    throw new Error('DecompressionStream is not supported in this browser.');
+  }
+  const stream = new Blob([arrayBuffer]).stream().pipeThrough(new DecompressionStream('gzip'));
+  const out = await new Response(stream).arrayBuffer();
+  return new Uint8Array(out);
+}
+
+async function loadProjectFile(file) {
+  showLoading('프로젝트 파일을 불러오는 중...', '기존 IndexedDB를 초기화하고 복원합니다.');
+  try {
+    resetEditorToNoProject();
+    await clearEditorSession();
+    const arrayBuffer = await file.arrayBuffer();
+    const lowerName = (file.name || '').toLowerCase();
+    const shouldGunzip = lowerName.endsWith('.pdfedit.gz');
+
+    const bytes = await ungzipIfNeeded(arrayBuffer, shouldGunzip);
+    const magicBytes = decodeProjectMagicBytes();
+    const magicLen = magicBytes.length;
+
+    const magicOk =
+      bytes.length >= magicLen &&
+      magicBytes.every((b, i) => bytes[i] === b);
+
+    if (!magicOk) {
+      throw new Error('Invalid .pdfedit file (magic header mismatch).');
+    }
+
+    const jsonLen = new DataView(bytes.buffer, bytes.byteOffset + magicLen, 4).getUint32(0, true);
+    const jsonStart = magicLen + 4;
+    const jsonEnd = jsonStart + jsonLen;
+    if (jsonEnd > bytes.length) throw new Error('Invalid .pdfedit file (json length out of bounds).');
+
+    const jsonBytes = bytes.slice(jsonStart, jsonEnd);
+    const jsonStr = new TextDecoder().decode(jsonBytes);
+    const project = JSON.parse(jsonStr);
+
+    const pdfBytes = bytes.slice(jsonEnd);
+    if (!pdfBytes || pdfBytes.byteLength === 0) throw new Error('Invalid .pdfedit file (missing pdf bytes).');
+
+    const pdfArrayBuffer = pdfBytes.buffer.slice(pdfBytes.byteOffset, pdfBytes.byteOffset + pdfBytes.byteLength);
+
+    await openPdfDocument(pdfArrayBuffer, {
+      displayName: project?.sourceFileName || file.name,
+      exportName: project?.originalFileName || 'edited_document.pdf',
+      restoredPageList: project?.pageList || [],
+      restoredPageIndex: typeof project?.currentPageIndex === 'number' ? project.currentPageIndex : 0,
+      skipSessionSave: true,
+    });
+
+    // openPdfDocument(restoredPageList)에서는 undo/redo용 in-memory baseline을 안 잡으므로 여기서 초기화합니다.
+    pageHistoryEventsMap = new Map();
+    pageHistoryPointerMap = new Map();
+    pageHistoryBaselineMap = new Map(pageList.map((p) => [p.id, takePageSnapshot(p)]));
+    pageList.forEach((p) => pageHistoryPointerMap.set(p.id, -1));
+
+    // IndexedDB에도 복원된 상태를 저장 시도(공간 부족이면 화면 복원만 유지)
+    try {
+      await persistSessionNow();
+    } catch (_e) {}
+
+    showToast('프로젝트가 성공적으로 복원되었습니다.', 'success');
+  } catch (error) {
+    console.error('Project Import Error:', error);
+    showToast('프로젝트 복원에 실패했습니다.', 'error');
   } finally {
     hideLoading();
   }
@@ -317,6 +506,14 @@ async function openPdfDocument(arrayBuffer, {
   if (btnExportProject) {
     btnExportProject.disabled = false;
     btnExportProject.classList.remove('opacity-50', 'cursor-not-allowed');
+  }
+  if (btnCloseProject) {
+    btnCloseProject.disabled = false;
+    btnCloseProject.classList.remove('opacity-50', 'cursor-not-allowed');
+  }
+  if (btnDeleteProject) {
+    btnDeleteProject.disabled = false;
+    btnDeleteProject.classList.remove('opacity-50', 'cursor-not-allowed');
   }
   btnCopyClipboard.disabled = false;
   btnCopyClipboard.classList.remove('opacity-50', 'cursor-not-allowed');
@@ -828,6 +1025,55 @@ function clearPdfCaches() {
   thumbnailCache.clear();
 }
 
+function resetEditorToNoProject() {
+  try {
+    if (isCropMode) exitCropModeInternal({ revertDraft: false });
+  } catch (_e) {}
+
+  // 메모리/상태만 비우고, IndexedDB는 건드리지 않습니다.
+  pdfDoc = null;
+  pdfSourceData = null;
+  currentRenderTask = null;
+  sourceFileName = '';
+  originalFileName = 'edited_document.pdf';
+
+  pageList = [];
+  currentPageIndex = -1;
+
+  isDraggingCrop = false;
+  isResizingCrop = false;
+  activeHandle = null;
+
+  cropBoxDraftSnapshot = null;
+  cropDraftDirty = false;
+
+  pageHistoryEventsMap = new Map();
+  pageHistoryPointerMap = new Map();
+  pageHistoryBaselineMap = new Map();
+
+  pdfSessionDirty = false;
+  sessionNeedsSave = false;
+
+  clearPdfCaches();
+  void renderCurrentPage();
+}
+
+async function deleteIndexedDbProjectAndReset() {
+  showLoading('프로젝트 삭제 중...', 'IndexedDB에 저장된 데이터를 지우고 있습니다.');
+  try {
+    await clearEditorSession(); // IndexedDB 삭제
+    showToast('프로젝트가 삭제되었습니다.', 'success');
+  } catch (err) {
+    console.error('Delete Project Error:', err);
+    showToast('프로젝트 삭제에 실패했습니다.', 'error');
+    throw err;
+  } finally {
+    hideLoading();
+  }
+
+  resetEditorToNoProject();
+}
+
 async function getPdfPageCached(pageNum) {
   if (pageCache.has(pageNum)) {
     return pageCache.get(pageNum);
@@ -847,8 +1093,17 @@ async function renderCurrentPage() {
       docName.textContent = 'Select a file';
       btnExportPdf.disabled = true;
       btnExportPdf.classList.add('opacity-50', 'cursor-not-allowed');
+      if (btnExportProject) {
+        btnExportProject.disabled = true;
+        btnExportProject.classList.add('opacity-50', 'cursor-not-allowed');
+      }
       btnCopyClipboard.disabled = true;
       btnCopyClipboard.classList.add('opacity-50', 'cursor-not-allowed');
+      if (btnUndoPage) btnUndoPage.disabled = true;
+      if (btnRedoPage) btnRedoPage.disabled = true;
+      if (btnCloseProject) btnCloseProject.disabled = true;
+      if (btnDeleteProject) btnDeleteProject.disabled = true;
+      renderSidebarThumbnails();
       return;
     }
     currentPageIndex = 0;
@@ -1945,10 +2200,93 @@ if (btnShowShortcuts) {
   });
 }
 
+if (btnCloseProject) {
+  btnCloseProject.addEventListener('click', () => {
+    closeShortcutsModal();
+    closeConfirmCropExitModal();
+    closeConfirmDeleteProjectModal();
+    resetEditorToNoProject();
+  });
+}
+
+if (btnDeleteProject) {
+  btnDeleteProject.addEventListener('click', async () => {
+    closeShortcutsModal();
+    closeConfirmCropExitModal();
+    closeConfirmDeleteProjectModal();
+    const confirmed = await openConfirmDeleteProjectModal();
+    if (!confirmed) return;
+    await deleteIndexedDbProjectAndReset();
+  });
+}
+
+if (btnRestoreRecentSession) {
+  btnRestoreRecentSession.addEventListener('click', async () => {
+    // restoreEditorSession 내부에서 로딩/토스트를 처리합니다.
+    await restoreEditorSession();
+  });
+}
+
+if (btnClearRecentSession) {
+  btnClearRecentSession.addEventListener('click', async () => {
+    closeShortcutsModal();
+    closeConfirmCropExitModal();
+    closeConfirmDeleteProjectModal();
+    const confirmed = await openConfirmDeleteProjectModal();
+    if (!confirmed) return;
+
+    showLoading('최근 작업 삭제 중...', 'IndexedDB를 초기화하고 있습니다.');
+    try {
+      await clearEditorSession();
+      showToast('최근 작업 상태가 삭제되었습니다.', 'info');
+      if (btnRestoreRecentSession) btnRestoreRecentSession.disabled = true;
+      if (btnClearRecentSession) btnClearRecentSession.disabled = true;
+      resetEditorToNoProject();
+    } catch (err) {
+      console.error('Clear Recent Session Error:', err);
+      showToast('최근 작업 삭제에 실패했습니다.', 'error');
+    } finally {
+      hideLoading();
+    }
+  });
+}
+
 currentPageNum.addEventListener('input', schedulePageInputNavigation);
 
 document.addEventListener('keydown', (e) => {
   // Modal shortcut handling (Esc/Enter) - 입력창 포커스 여부와 무관하게 동작
+  if (isConfirmAfterProjectExportModalOpen) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      if (confirmAfterProjectExportResolve) confirmAfterProjectExportResolve(false);
+      closeConfirmAfterProjectExportModal();
+      return;
+    }
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (confirmAfterProjectExportResolve) confirmAfterProjectExportResolve(true);
+      closeConfirmAfterProjectExportModal();
+      return;
+    }
+    return;
+  }
+
+  if (isConfirmDeleteProjectModalOpen) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      if (confirmDeleteProjectResolve) confirmDeleteProjectResolve(false);
+      closeConfirmDeleteProjectModal();
+      return;
+    }
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (confirmDeleteProjectResolve) confirmDeleteProjectResolve(true);
+      closeConfirmDeleteProjectModal();
+      return;
+    }
+    return;
+  }
+
   if (isConfirmCropExitModalOpen) {
     if (e.key === 'Escape') {
       e.preventDefault();
@@ -2415,6 +2753,7 @@ btnExportProject?.addEventListener('click', async () => {
   if (pageList.length === 0 || !pdfSourceData) return;
 
   showLoading('프로젝트 파일 생성 중...', '원본 PDF + 편집 상태를 묶고 있습니다.');
+  let loadingActive = true;
   try {
     const suggestedNameBase = (originalFileName || sourceFileName || 'pdf_project')
       .replace(/\.pdf$/i, '')
@@ -2461,11 +2800,30 @@ btnExportProject?.addEventListener('click', async () => {
     }
 
     showToast('프로젝트 파일이 성공적으로 다운로드되었습니다.', 'success');
+
+    // 다운로드가 끝났으므로 로딩 오버레이를 먼저 닫고, 정리 여부를 확인합니다.
+    loadingActive = false;
+    hideLoading();
+    closeShortcutsModal();
+    closeConfirmCropExitModal();
+    closeConfirmDeleteProjectModal();
+
+    const shouldCleanupAndClose = await openConfirmAfterProjectExportModal();
+    if (shouldCleanupAndClose) {
+      showLoading('정리 중...', 'IndexedDB 캐시를 삭제하고 프로젝트를 닫습니다.');
+      try {
+        await clearEditorSession();
+        resetEditorToNoProject();
+        showToast('IndexedDB가 삭제되었고 프로젝트가 닫혔습니다.', 'info');
+      } finally {
+        hideLoading();
+      }
+    }
   } catch (err) {
     console.error('Project Export Error:', err);
     showToast('프로젝트 파일 생성에 실패했습니다.', 'error');
   } finally {
-    hideLoading();
+    if (loadingActive) hideLoading();
   }
 });
 
@@ -2622,6 +2980,14 @@ export async function initPdfPageEditor() {
   });
 
   window.addEventListener('beforeunload', handleBeforeUnload);
+
+  // Intro 화면 버튼 상태: 최근 작업이 있는 경우에만 복구/삭제 활성
+  try {
+    const session = await loadEditorSession();
+    const hasSession = !!session;
+    if (btnRestoreRecentSession) btnRestoreRecentSession.disabled = !hasSession;
+    if (btnClearRecentSession) btnClearRecentSession.disabled = !hasSession;
+  } catch (_e) {}
 
   await restoreEditorSession();
 }
