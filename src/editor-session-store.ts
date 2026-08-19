@@ -238,6 +238,73 @@ export function savePageHistoryEvent(pageId, event) {
   });
 }
 
+export function setPageHistoryEvents(pageId, events) {
+  return runWriteTransaction([PAGE_HISTORY_STORE], ([store]) => {
+    return new Promise((resolve, reject) => {
+      const getReq = store.get(pageId);
+      getReq.onsuccess = () => {
+        const existing = getReq.result;
+        store.put({
+          pageId,
+          updatedAt: Date.now(),
+          events: Array.isArray(events) ? events : [],
+          pointer: existing?.pointer,
+          baselineSnapshot: existing?.baselineSnapshot ?? null,
+        });
+        resolve();
+      };
+      getReq.onerror = () => reject(getReq.error);
+    });
+  });
+}
+
+export function setPageHistoryPointer(pageId, pointer) {
+  return runWriteTransaction([PAGE_HISTORY_STORE], ([store]) => {
+    return new Promise((resolve, reject) => {
+      const getReq = store.get(pageId);
+      getReq.onsuccess = () => {
+        const existing = getReq.result;
+        const events = Array.isArray(existing?.events) ? existing.events : [];
+        const baselineSnapshot = existing?.baselineSnapshot ?? null;
+        store.put({
+          pageId,
+          updatedAt: Date.now(),
+          events,
+          pointer: typeof pointer === 'number' ? pointer : -1,
+          baselineSnapshot,
+        });
+        resolve();
+      };
+      getReq.onerror = () => reject(getReq.error);
+    });
+  });
+}
+
+export function setPageHistoryBaseline(pageId, baselineSnapshot) {
+  return runWriteTransaction([PAGE_HISTORY_STORE], ([store]) => {
+    return new Promise((resolve, reject) => {
+      const getReq = store.get(pageId);
+      getReq.onsuccess = () => {
+        const existing = getReq.result;
+        const events = Array.isArray(existing?.events) ? existing.events : [];
+        const pointer =
+          typeof existing?.pointer === 'number'
+            ? existing.pointer
+            : events.length - 1;
+        store.put({
+          pageId,
+          updatedAt: Date.now(),
+          events,
+          pointer,
+          baselineSnapshot: baselineSnapshot ?? null,
+        });
+        resolve();
+      };
+      getReq.onerror = () => reject(getReq.error);
+    });
+  });
+}
+
 export function loadPageHistories() {
   return runReadTransaction([PAGE_HISTORY_STORE], ([store]) => {
     return new Promise((resolve, reject) => {
@@ -247,6 +314,45 @@ export function loadPageHistories() {
         for (const record of request.result ?? []) {
           if (!record?.pageId) continue;
           map.set(record.pageId, Array.isArray(record.events) ? record.events : []);
+        }
+        resolve(map);
+      };
+      request.onerror = () => reject(request.error);
+    });
+  });
+}
+
+export function loadPageHistoryBaselines() {
+  return runReadTransaction([PAGE_HISTORY_STORE], ([store]) => {
+    return new Promise((resolve, reject) => {
+      const request = store.getAll();
+      request.onsuccess = () => {
+        const map = new Map();
+        for (const record of request.result ?? []) {
+          if (!record?.pageId) continue;
+          if (record?.baselineSnapshot) map.set(record.pageId, record.baselineSnapshot);
+        }
+        resolve(map);
+      };
+      request.onerror = () => reject(request.error);
+    });
+  });
+}
+
+export function loadPageHistoryPointers() {
+  return runReadTransaction([PAGE_HISTORY_STORE], ([store]) => {
+    return new Promise((resolve, reject) => {
+      const request = store.getAll();
+      request.onsuccess = () => {
+        const map = new Map();
+        for (const record of request.result ?? []) {
+          if (!record?.pageId) continue;
+          if (typeof record.pointer === 'number') {
+            map.set(record.pageId, record.pointer);
+            continue;
+          }
+          const events = Array.isArray(record.events) ? record.events : [];
+          map.set(record.pageId, events.length - 1);
         }
         resolve(map);
       };
@@ -268,12 +374,22 @@ export function clearPageHistories() {
 }
 
 export async function loadEditorSession() {
-  const [pdfRecord, stateRecord, legacyRecord, pageAssets, pageHistories] = await Promise.all([
+  const [
+    pdfRecord,
+    stateRecord,
+    legacyRecord,
+    pageAssets,
+    pageHistories,
+    pageHistoryPointers,
+    pageHistoryBaselines,
+  ] = await Promise.all([
     getRecord(EDITOR_PDF_KEY),
     getRecord(EDITOR_STATE_KEY),
     getRecord('current'),
     loadPageAssets(),
     loadPageHistories(),
+    loadPageHistoryPointers(),
+    loadPageHistoryBaselines(),
   ]);
 
   if (pdfRecord?.pdfData && stateRecord?.pageList?.length) {
@@ -286,6 +402,8 @@ export async function loadEditorSession() {
       savedAt: stateRecord.savedAt ?? 0,
       pageAssets,
       pageHistories,
+      pageHistoryPointers,
+      pageHistoryBaselines,
     };
   }
 
@@ -299,6 +417,8 @@ export async function loadEditorSession() {
       savedAt: legacyRecord.savedAt ?? 0,
       pageAssets: hydrateLegacyPageAssets(legacyRecord.pageList, pageAssets),
       pageHistories,
+      pageHistoryPointers,
+      pageHistoryBaselines,
     };
   }
 

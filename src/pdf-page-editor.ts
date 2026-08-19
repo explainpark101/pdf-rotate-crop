@@ -9,6 +9,9 @@ import {
   saveEditorStateRecord,
   savePageAssetsIncremental,
   savePageHistoryEvent,
+  setPageHistoryEvents,
+  setPageHistoryBaseline,
+  setPageHistoryPointer,
 } from '@/editor-session-store.ts';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url).toString();
@@ -31,8 +34,20 @@ let virtualScrollRaf = null;
 let pageList = [];
 let currentPageIndex = -1;
 
+// 페이지 단위 undo/redo를 위한 in-memory 상태
+// - pageHistoryEventsMap: IndexedDB에서 복원/적용된 events 배열
+// - pageHistoryPointerMap: 현재 적용된 이벤트 인덱스(undo/redo 시 변경)
+// - pageHistoryBaselineMap: pointer=-1일 때의 기준 스냅샷
+let pageHistoryEventsMap = new Map(); // pageId -> events[]
+let pageHistoryPointerMap = new Map(); // pageId -> pointer
+let pageHistoryBaselineMap = new Map(); // pageId -> snapshot
+let isRestoredSession = false;
+let trustedBaselinePageIds = new Set(); // DB에 baseline이 있는 페이지(또는 새로 생성된 페이지)
+
 let isCropMode = false;
 let cropBox = { x: 0.1, y: 0.1, w: 0.8, h: 0.8 };
+let cropBoxDraftSnapshot = null; // crop 모드 진입 시점의 박스(변경 여부 판단용)
+let cropDraftDirty = false; // 현재 cropBox가 snapshot과 다른지 여부
 let isDraggingCrop = false;
 let isResizingCrop = false;
 let activeHandle = null;
@@ -94,10 +109,106 @@ const btnAddCroppedPage = document.getElementById('btnAddCroppedPage');
 const btnDeleteCurrentPage = document.getElementById('btnDeleteCurrentPage');
 const btnPrevPage = document.getElementById('btnPrevPage');
 const btnNextPage = document.getElementById('btnNextPage');
+const btnUndoPage = document.getElementById('btnUndoPage');
+const btnRedoPage = document.getElementById('btnRedoPage');
 const btnExportPdf = document.getElementById('btnExportPdf');
+const btnShowShortcuts = document.getElementById('btnShowShortcuts');
 const btnCopyClipboard = document.getElementById('btnCopyClipboard');
 const loadingOverlay = document.getElementById('loadingOverlay');
 const viewportContainer = document.getElementById('viewportContainer');
+
+// ----- Modals (Shortcuts / Confirm) -----
+let isShortcutsModalOpen = false;
+let isConfirmCropExitModalOpen = false;
+let confirmCropExitResolve = null;
+
+function openShortcutsModal() {
+  const el = document.getElementById('shortcutsModal');
+  if (!el) return;
+  el.classList.remove('hidden');
+  isShortcutsModalOpen = true;
+}
+
+function closeShortcutsModal() {
+  const el = document.getElementById('shortcutsModal');
+  if (!el) return;
+  el.classList.add('hidden');
+  isShortcutsModalOpen = false;
+}
+
+function openConfirmCropExitModal() {
+  const el = document.getElementById('confirmCropExitModal');
+  if (!el) return Promise.resolve(false);
+  el.classList.remove('hidden');
+  isConfirmCropExitModalOpen = true;
+
+  return new Promise((resolve) => {
+    confirmCropExitResolve = resolve;
+  });
+}
+
+function closeConfirmCropExitModal() {
+  const el = document.getElementById('confirmCropExitModal');
+  if (!el) return;
+  el.classList.add('hidden');
+  isConfirmCropExitModalOpen = false;
+  confirmCropExitResolve = null;
+}
+
+// Create modal DOM once.
+(() => {
+  if (!document.getElementById('shortcutsModal')) {
+    const overlay = document.createElement('div');
+    overlay.id = 'shortcutsModal';
+    overlay.className = 'hidden fixed inset-0 bg-black/50 z-[100] flex items-center justify-center px-4';
+    overlay.innerHTML = `
+      <div class="w-full max-w-lg bg-white rounded-xl shadow-xl border border-slate-200 p-4">
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="font-bold text-slate-900">단축키</h3>
+          <button id="btnCloseShortcutsModal" class="px-2 py-1 rounded hover:bg-slate-100 text-slate-700">닫기</button>
+        </div>
+        <div class="text-sm text-slate-700 space-y-3">
+          <div><div class="font-semibold text-slate-900">회전</div><div class="mt-1">Enter(적용) / q,e (±1도), Shift+q/e=±10도, Alt(opt)+q/e=±0.1도</div></div>
+          <div><div class="font-semibold text-slate-900">Crop 모드</div><div class="mt-1">c=모드 토글 / Enter(현재 crop 적용) / a=왼쪽 50% 프리셋 / s=중앙 80% 프리셋</div></div>
+          <div><div class="font-semibold text-slate-900">Crop 수정</div><div class="mt-1">Arrow=이동 / Alt+Arrow=크기(10px 단위)</div></div>
+        </div>
+        <div class="mt-4 text-xs text-slate-500">
+          모달이 열려있을 때는 다른 단축키가 일시적으로 동작하지 않습니다. (Esc로 닫기)
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+
+    const btn = overlay.querySelector('#btnCloseShortcutsModal');
+    btn?.addEventListener('click', closeShortcutsModal);
+  }
+
+  if (!document.getElementById('confirmCropExitModal')) {
+    const overlay = document.createElement('div');
+    overlay.id = 'confirmCropExitModal';
+    overlay.className = 'hidden fixed inset-0 bg-black/50 z-[100] flex items-center justify-center px-4';
+    overlay.innerHTML = `
+      <div class="w-full max-w-md bg-white rounded-xl shadow-xl border border-slate-200 p-4">
+        <div class="font-bold text-slate-900 mb-2">Crop 변경을 취소할까요?</div>
+        <div class="text-sm text-slate-700 mb-4">현재 crop 박스 수정 내용을 버리고 crop 모드를 종료합니다.</div>
+        <div class="flex items-center justify-end gap-2">
+          <button id="btnCancelConfirmCropExit" class="px-3 py-2 rounded bg-slate-100 hover:bg-slate-200 text-slate-800">취소</button>
+          <button id="btnConfirmConfirmCropExit" class="px-3 py-2 rounded bg-blue-600 hover:bg-blue-500 text-white">확인</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+
+    overlay.querySelector('#btnCancelConfirmCropExit')?.addEventListener('click', () => {
+      if (confirmCropExitResolve) confirmCropExitResolve(false);
+      closeConfirmCropExitModal();
+    });
+    overlay.querySelector('#btnConfirmConfirmCropExit')?.addEventListener('click', () => {
+      if (confirmCropExitResolve) confirmCropExitResolve(true);
+      closeConfirmCropExitModal();
+    });
+  }
+})();
 
 dropzone.addEventListener('click', () => pdfFileInput.click());
 
@@ -183,6 +294,17 @@ async function openPdfDocument(arrayBuffer, {
       customImageDataUrl: null,
     }));
     currentPageIndex = 0;
+
+    isRestoredSession = false;
+    trustedBaselinePageIds = new Set(pageList.map((p) => p.id));
+
+    // 신규 로드 시 undo/redo history는 비어있음(기준 스냅샷만 구성)
+    pageHistoryEventsMap = new Map();
+    pageHistoryPointerMap = new Map();
+    pageHistoryBaselineMap = new Map(
+      pageList.map((p) => [p.id, takePageSnapshot(p)])
+    );
+    pageList.forEach((p) => pageHistoryPointerMap.set(p.id, -1));
   }
 
   dropzone.classList.add('hidden');
@@ -264,26 +386,169 @@ function hydratePageListFromSession(pages, pageAssets = new Map()) {
   });
 }
 
-function applyPageHistoriesToPageList(pages, pageHistories = new Map()) {
+function applyPageHistoriesToPageList(
+  pages,
+  pageHistories = new Map(),
+  pagePointers = new Map(),
+  baselineMap = new Map()
+) {
   if (!pages?.length) return;
   if (!pageHistories) return;
 
   for (const page of pages) {
     const events = pageHistories.get(page.id);
+
+    const pointer =
+      typeof pagePointers?.get(page.id) === 'number'
+        ? pagePointers.get(page.id)
+        : (Array.isArray(events) ? events.length : 0) - 1;
+
+    const baseSnapshot = baselineMap?.get(page.id);
+    if (baseSnapshot) applySnapshotToPage(page, baseSnapshot);
+
     if (!Array.isArray(events) || events.length === 0) continue;
+    if (pointer < 0) continue;
 
-    // 이벤트가 있다는 것은 "이 시점의 결과 스냅샷"을 복원할 수 있다는 뜻이므로,
-    // 이벤트 순서대로 snapshot을 재적용합니다.
-    for (const event of events) {
-      const snap = event?.snapshot;
+    // undo/redo pointer에 맞게 이벤트 snapshot을 "앞부분만" 재적용합니다.
+    for (let i = 0; i <= pointer && i < events.length; i++) {
+      const snap = events[i]?.snapshot;
       if (!snap) continue;
-
-      if ('originalPageIndex' in snap) page.originalPageIndex = snap.originalPageIndex ?? null;
-      if ('rotation' in snap) page.rotation = typeof snap.rotation === 'number' ? snap.rotation : page.rotation;
-      if ('crop' in snap) page.crop = snap.crop ?? null;
-      if ('customImageDataUrl' in snap) page.customImageDataUrl = snap.customImageDataUrl ?? null;
+      applySnapshotToPage(page, snap);
     }
   }
+}
+
+function takePageSnapshot(page) {
+  return {
+    originalPageIndex: page.originalPageIndex ?? null,
+    rotation: typeof page.rotation === 'number' ? page.rotation : 0,
+    crop: page.crop ?? null,
+    customImageDataUrl: page.customImageDataUrl ?? null,
+  };
+}
+
+function applySnapshotToPage(page, snapshot) {
+  if (!page || !snapshot) return;
+  if ('originalPageIndex' in snapshot) page.originalPageIndex = snapshot.originalPageIndex ?? null;
+  if ('rotation' in snapshot) page.rotation = typeof snapshot.rotation === 'number' ? snapshot.rotation : 0;
+  if ('crop' in snapshot) page.crop = snapshot.crop ?? null;
+  if ('customImageDataUrl' in snapshot) page.customImageDataUrl = snapshot.customImageDataUrl ?? null;
+}
+
+function updateUndoRedoButtons() {
+  if (!btnUndoPage || !btnRedoPage) return;
+
+  const applyBtnStyle = (btn, enabled) => {
+    if (!btn) return;
+    btn.classList.toggle('opacity-50', !enabled);
+    btn.classList.toggle('cursor-not-allowed', !enabled);
+    btn.classList.toggle('bg-slate-800', !enabled);
+    btn.classList.toggle('hover:bg-slate-700', !enabled);
+    btn.classList.toggle('text-slate-200', !enabled);
+
+    btn.classList.toggle('bg-blue-600', enabled);
+    btn.classList.toggle('hover:bg-blue-500', enabled);
+    btn.classList.toggle('text-white', enabled);
+  };
+
+  if (currentPageIndex < 0 || currentPageIndex >= pageList.length) {
+    btnUndoPage.disabled = true;
+    btnRedoPage.disabled = true;
+    applyBtnStyle(btnUndoPage, false);
+    applyBtnStyle(btnRedoPage, false);
+    return;
+  }
+
+  const pageId = pageList[currentPageIndex].id;
+  const events = pageHistoryEventsMap.get(pageId) || [];
+  const pointer =
+    typeof pageHistoryPointerMap.get(pageId) === 'number'
+      ? pageHistoryPointerMap.get(pageId)
+      : events.length - 1;
+
+  const canUndo = pointer >= 0;
+  const canRedo = pointer < events.length - 1;
+
+  btnUndoPage.disabled = !canUndo;
+  btnRedoPage.disabled = !canRedo;
+
+  applyBtnStyle(btnUndoPage, canUndo);
+  applyBtnStyle(btnRedoPage, canRedo);
+}
+
+async function commitPageHistoryEvent(pageId, event) {
+  const events = pageHistoryEventsMap.get(pageId) ? [...pageHistoryEventsMap.get(pageId)] : [];
+  const pointer =
+    typeof pageHistoryPointerMap.get(pageId) === 'number'
+      ? pageHistoryPointerMap.get(pageId)
+      : events.length - 1;
+
+  // undo 이후 새로운 작업이면 redo 구간 제거
+  const truncated = events.slice(0, pointer + 1);
+  truncated.push(event);
+
+  pageHistoryEventsMap.set(pageId, truncated);
+  pageHistoryPointerMap.set(pageId, truncated.length - 1);
+
+  const baselineSnapshot = pageHistoryBaselineMap.get(pageId);
+  if (baselineSnapshot && (!isRestoredSession || trustedBaselinePageIds.has(pageId))) {
+    await setPageHistoryBaseline(pageId, baselineSnapshot);
+  }
+
+  await setPageHistoryEvents(pageId, truncated);
+  await setPageHistoryPointer(pageId, truncated.length - 1);
+  updateUndoRedoButtons();
+}
+
+async function applyHistoryPointerToCurrentPage(pageId, pointer) {
+  const pageIndex = pageList.findIndex((p) => p.id === pageId);
+  if (pageIndex < 0) return;
+
+  const page = pageList[pageIndex];
+  if (pointer < 0) {
+    const base = pageHistoryBaselineMap.get(pageId);
+    applySnapshotToPage(page, base);
+  } else {
+    const events = pageHistoryEventsMap.get(pageId) || [];
+    const snap = events[pointer]?.snapshot;
+    applySnapshotToPage(page, snap);
+  }
+
+  renderSidebarThumbnails();
+  await renderCurrentPage();
+  updateUndoRedoButtons();
+}
+
+async function undoOnCurrentPage() {
+  if (currentPageIndex < 0 || currentPageIndex >= pageList.length) return;
+  const pageId = pageList[currentPageIndex].id;
+  const events = pageHistoryEventsMap.get(pageId) || [];
+  const pointer =
+    typeof pageHistoryPointerMap.get(pageId) === 'number'
+      ? pageHistoryPointerMap.get(pageId)
+      : events.length - 1;
+
+  if (pointer < 0) return;
+  const nextPointer = pointer - 1;
+  pageHistoryPointerMap.set(pageId, nextPointer);
+  await setPageHistoryPointer(pageId, nextPointer);
+  await applyHistoryPointerToCurrentPage(pageId, nextPointer);
+}
+
+async function redoOnCurrentPage() {
+  if (currentPageIndex < 0 || currentPageIndex >= pageList.length) return;
+  const pageId = pageList[currentPageIndex].id;
+  const events = pageHistoryEventsMap.get(pageId) || [];
+  const pointer =
+    typeof pageHistoryPointerMap.get(pageId) === 'number'
+      ? pageHistoryPointerMap.get(pageId)
+      : events.length - 1;
+
+  if (pointer >= events.length - 1) return;
+  const nextPointer = pointer + 1;
+  pageHistoryPointerMap.set(pageId, nextPointer);
+  await setPageHistoryPointer(pageId, nextPointer);
+  await applyHistoryPointerToCurrentPage(pageId, nextPointer);
 }
 
 function getPageIndexCacheKey(fileName = sourceFileName) {
@@ -480,7 +745,36 @@ async function restoreEditorSession() {
       session.pageAssets ?? new Map()
     );
 
-    applyPageHistoriesToPageList(hydratedPageList, session.pageHistories ?? new Map());
+    // undo/redo 기준 상태/포인터 초기화
+    const restoredPageHistories = session.pageHistories ?? new Map();
+    const restoredPageHistoryPointers = session.pageHistoryPointers ?? new Map();
+    const restoredPageHistoryBaselines = session.pageHistoryBaselines ?? new Map();
+
+    isRestoredSession = true;
+    trustedBaselinePageIds = new Set(restoredPageHistoryBaselines.keys());
+
+    pageHistoryEventsMap = restoredPageHistories;
+    pageHistoryBaselineMap = new Map(
+      hydratedPageList.map((p) => [
+        p.id,
+        restoredPageHistoryBaselines.get(p.id) ?? takePageSnapshot(p),
+      ])
+    );
+    pageHistoryPointerMap = new Map(
+      hydratedPageList.map((p) => [
+        p.id,
+        typeof restoredPageHistoryPointers.get(p.id) === 'number'
+          ? restoredPageHistoryPointers.get(p.id)
+          : (restoredPageHistories.get(p.id) || []).length - 1,
+      ])
+    );
+
+    applyPageHistoriesToPageList(
+      hydratedPageList,
+      restoredPageHistories,
+      pageHistoryPointerMap,
+      pageHistoryBaselineMap
+    );
     const restoredPageIndex = resolveRestoredPageIndex(
       session.currentPageIndex,
       session.sourceFileName,
@@ -577,6 +871,7 @@ async function renderCurrentPage() {
 
   updateSidebarActiveHighlight();
   scrollThumbnailIntoView(currentPageIndex);
+  updateUndoRedoButtons();
 
   const seq = ++renderSeq;
 
@@ -1002,37 +1297,11 @@ function updateSidebarThumbnailRotation(index, deg) {
 }
 
 btnToggleCrop.addEventListener('click', () => {
-  isCropMode = !isCropMode;
-  if (isCropMode) {
-    btnToggleCrop.classList.replace('bg-slate-100', 'bg-slate-300');
-    btnToggleCrop.classList.replace('hover:bg-blue-50', 'hover:bg-slate-500');
-    btnToggleCrop.classList.replace('text-slate-700', 'text-white');
-    cropBtnText.textContent = 'Cancel Crop';
-    cropOverlay.classList.remove('hidden');
-    cropPresetGroup.classList.remove('hidden');
-    cropPresetGroup.classList.add('flex');
-    btnApplyCropToPage.classList.remove('hidden');
-    btnAddCroppedPage.classList.remove('hidden');
-
-    // In crop mode, increase the canvas max height so the overlay is more visible.
-    pdfCanvas.classList.remove(PDF_CANVAS_MAX_H_DEFAULT_CLASS);
-    pdfCanvas.classList.add(PDF_CANVAS_MAX_H_CROP_CLASS);
-
-    applyCropPreset('center80');
-  } else {
-    btnToggleCrop.classList.replace('bg-slate-600', 'bg-slate-100');
-    btnToggleCrop.classList.replace('hover:bg-slate-500', 'hover:bg-blue-50');
-    btnToggleCrop.classList.replace('text-white', 'text-slate-700');
-    cropBtnText.textContent = '영역 크롭 모드';
-    cropOverlay.classList.add('hidden');
-    cropPresetGroup.classList.add('hidden');
-    cropPresetGroup.classList.remove('flex');
-    btnApplyCropToPage.classList.add('hidden');
-    btnAddCroppedPage.classList.add('hidden');
-
-    pdfCanvas.classList.remove(PDF_CANVAS_MAX_H_CROP_CLASS);
-    pdfCanvas.classList.add(PDF_CANVAS_MAX_H_DEFAULT_CLASS);
+  if (!isCropMode) {
+    enterCropMode();
+    return;
   }
+  void attemptExitCropModeWithConfirm();
 });
 
 function applyCropPreset(presetKey) {
@@ -1078,6 +1347,103 @@ function updateCropOverlayPosition() {
   const pxW = Math.round(cropBox.w * pdfCanvas.width);
   const pxH = Math.round(cropBox.h * pdfCanvas.height);
   cropSizeLabel.textContent = `${pxW} x ${pxH} px`;
+
+  // cropDraftDirty 판단은 cropBox 변경이 있을 때마다 갱신합니다.
+  updateCropDraftDirty();
+}
+
+function cropBoxesEqual(a, b, eps = 1e-6) {
+  if (!a || !b) return false;
+  return (
+    Math.abs(a.x - b.x) < eps &&
+    Math.abs(a.y - b.y) < eps &&
+    Math.abs(a.w - b.w) < eps &&
+    Math.abs(a.h - b.h) < eps
+  );
+}
+
+function updateCropDraftDirty() {
+  if (!isCropMode) return;
+  if (!cropBoxDraftSnapshot) {
+    cropDraftDirty = false;
+    return;
+  }
+  cropDraftDirty = !cropBoxesEqual(cropBox, cropBoxDraftSnapshot);
+}
+
+function enterCropMode() {
+  if (isCropMode) return;
+  isCropMode = true;
+
+  cropBtnText.textContent = 'Cancel Crop';
+
+  btnToggleCrop.classList.add('bg-slate-300');
+  btnToggleCrop.classList.remove('bg-slate-100');
+  btnToggleCrop.classList.add('hover:bg-slate-500');
+  btnToggleCrop.classList.remove('hover:bg-blue-50');
+  btnToggleCrop.classList.add('text-white');
+  btnToggleCrop.classList.remove('text-slate-700');
+
+  cropOverlay.classList.remove('hidden');
+  cropPresetGroup.classList.remove('hidden');
+  cropPresetGroup.classList.add('flex');
+  btnApplyCropToPage.classList.remove('hidden');
+  btnAddCroppedPage.classList.remove('hidden');
+
+  pdfCanvas.classList.remove(PDF_CANVAS_MAX_H_DEFAULT_CLASS);
+  pdfCanvas.classList.add(PDF_CANVAS_MAX_H_CROP_CLASS);
+
+  // Default preset으로 draft 시작
+  cropBoxDraftSnapshot = null;
+  cropDraftDirty = false;
+  applyCropPreset('center80');
+  cropBoxDraftSnapshot = { ...cropBox };
+  cropDraftDirty = false;
+}
+
+function exitCropModeInternal({ revertDraft = false } = {}) {
+  if (!isCropMode) return;
+  isCropMode = false;
+
+  // revertDraft: cropBox 변경을 버리고 snapshot 상태로 복원
+  if (revertDraft && cropBoxDraftSnapshot) {
+    cropBox = { ...cropBoxDraftSnapshot };
+    updateCropOverlayPosition();
+  }
+
+  cropBtnText.textContent = '영역 크롭 모드';
+
+  btnToggleCrop.classList.remove('bg-slate-300');
+  btnToggleCrop.classList.add('bg-slate-100');
+  btnToggleCrop.classList.remove('hover:bg-slate-500');
+  btnToggleCrop.classList.add('hover:bg-blue-50');
+  btnToggleCrop.classList.remove('text-white');
+  btnToggleCrop.classList.add('text-slate-700');
+
+  cropOverlay.classList.add('hidden');
+  cropPresetGroup.classList.add('hidden');
+  cropPresetGroup.classList.remove('flex');
+
+  btnApplyCropToPage.classList.add('hidden');
+  btnAddCroppedPage.classList.add('hidden');
+
+  pdfCanvas.classList.remove(PDF_CANVAS_MAX_H_CROP_CLASS);
+  pdfCanvas.classList.add(PDF_CANVAS_MAX_H_DEFAULT_CLASS);
+
+  cropBoxDraftSnapshot = null;
+  cropDraftDirty = false;
+}
+
+async function attemptExitCropModeWithConfirm() {
+  if (!isCropMode) return;
+  if (!cropDraftDirty) {
+    exitCropModeInternal({ revertDraft: false });
+    return;
+  }
+
+  const confirmed = await openConfirmCropExitModal();
+  if (!confirmed) return;
+  exitCropModeInternal({ revertDraft: true });
 }
 
 cropOverlay.addEventListener('mousedown', (e) => {
@@ -1144,6 +1510,140 @@ function onCropMouseUp() {
   document.removeEventListener('mouseup', onCropMouseUp);
 }
 
+function getCropStepDelta(axis, pixelStep = 10) {
+  const basis = axis === 'x' ? pdfCanvas.offsetWidth : pdfCanvas.offsetHeight;
+  if (!basis) return 0;
+  return pixelStep / basis;
+}
+
+function moveCropBoxByPixels(deltaX, deltaY) {
+  if (!isCropMode) return;
+
+  const stepX = getCropStepDelta('x', deltaX);
+  const stepY = getCropStepDelta('y', deltaY);
+  const nextX = Math.max(0, Math.min(1 - cropBox.w, cropBox.x + stepX));
+  const nextY = Math.max(0, Math.min(1 - cropBox.h, cropBox.y + stepY));
+
+  cropBox = {
+    ...cropBox,
+    x: nextX,
+    y: nextY,
+  };
+  updateCropOverlayPosition();
+}
+
+function resizeCropBoxByPixels(deltaWidth, deltaHeight) {
+  if (!isCropMode) return;
+
+  const stepW = getCropStepDelta('x', deltaWidth);
+  const stepH = getCropStepDelta('y', deltaHeight);
+  const nextW = Math.max(0.05, Math.min(1 - cropBox.x, cropBox.w + stepW));
+  const nextH = Math.max(0.05, Math.min(1 - cropBox.y, cropBox.h + stepH));
+
+  cropBox = {
+    ...cropBox,
+    w: nextW,
+    h: nextH,
+  };
+  updateCropOverlayPosition();
+}
+
+function getRotationShortcutStep(event) {
+  if (event.altKey) return 0.1;
+  if (event.shiftKey) return 10;
+  return 1;
+}
+
+function handleCropShortcut(event) {
+  if (!isCropMode) return false;
+
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    void btnApplyCropToPage.click();
+    return true;
+  }
+
+  if (event.key === 'a' || event.key === 'A') {
+    event.preventDefault();
+    applyCropPreset('leftHalf');
+    return true;
+  }
+
+  if (event.key === 's' || event.key === 'S') {
+    event.preventDefault();
+    applyCropPreset('center80');
+    return true;
+  }
+
+  const cropStepPx = 10;
+  if (event.altKey || event.shiftKey) {
+    if (event.key === 'ArrowLeft') {
+      event.preventDefault();
+      resizeCropBoxByPixels(-cropStepPx, 0);
+      return true;
+    }
+    if (event.key === 'ArrowRight') {
+      event.preventDefault();
+      resizeCropBoxByPixels(cropStepPx, 0);
+      return true;
+    }
+    if (event.key === 'ArrowUp') {
+      event.preventDefault();
+      resizeCropBoxByPixels(0, -cropStepPx);
+      return true;
+    }
+    if (event.key === 'ArrowDown') {
+      event.preventDefault();
+      resizeCropBoxByPixels(0, cropStepPx);
+      return true;
+    }
+  }
+
+  if (event.key === 'ArrowLeft') {
+    event.preventDefault();
+    moveCropBoxByPixels(-cropStepPx, 0);
+    return true;
+  }
+  if (event.key === 'ArrowRight') {
+    event.preventDefault();
+    moveCropBoxByPixels(cropStepPx, 0);
+    return true;
+  }
+  if (event.key === 'ArrowUp') {
+    event.preventDefault();
+    moveCropBoxByPixels(0, -cropStepPx);
+    return true;
+  }
+  if (event.key === 'ArrowDown') {
+    event.preventDefault();
+    moveCropBoxByPixels(0, cropStepPx);
+    return true;
+  }
+
+  return false;
+}
+
+function handleRotationShortcut(event) {
+  if (event.key !== 'q' && event.key !== 'Q' && event.key !== 'e' && event.key !== 'E' && event.key !== 'Enter') {
+    return false;
+  }
+
+  if (event.key === 'Enter') {
+    if (isCropMode) return false;
+    if (currentPageIndex < 0 || currentPageIndex >= pageList.length) return false;
+    if (isRotationZero(pageList[currentPageIndex].rotation)) return false;
+    event.preventDefault();
+    void btnApplyRotationToPage.click();
+    return true;
+  }
+
+  const sign = event.key.toLowerCase() === 'q' ? -1 : 1;
+  const step = getRotationShortcutStep(event);
+  event.preventDefault();
+  setPageRotation(pageList[currentPageIndex].rotation + sign * step);
+  return true;
+}
+
 btnAddCroppedPage.addEventListener('click', async () => {
   showLoading('크롭 영역 추출 중...', '선택한 영역을 새 페이지로 생성하고 있습니다.');
   try {
@@ -1160,7 +1660,12 @@ btnAddCroppedPage.addEventListener('click', async () => {
     pageList.splice(currentPageIndex + 1, 0, newPageItem);
     currentPageIndex++;
 
-    await savePageHistoryEvent(newPageItem.id, {
+    pageHistoryEventsMap.set(newPageItem.id, []);
+    pageHistoryPointerMap.set(newPageItem.id, -1);
+    pageHistoryBaselineMap.set(newPageItem.id, takePageSnapshot(newPageItem));
+    trustedBaselinePageIds.add(newPageItem.id);
+
+    await commitPageHistoryEvent(newPageItem.id, {
       type: 'crop_add',
       ts: Date.now(),
       snapshot: {
@@ -1171,7 +1676,7 @@ btnAddCroppedPage.addEventListener('click', async () => {
       },
     });
 
-    btnToggleCrop.click();
+    exitCropModeInternal({ revertDraft: false });
 
     await renderSidebarThumbnails();
     await renderCurrentPage();
@@ -1202,7 +1707,7 @@ btnApplyCropToPage.addEventListener('click', async () => {
       customImageDataUrl: croppedDataUrl
     };
 
-    await savePageHistoryEvent(pageId, {
+    await commitPageHistoryEvent(pageId, {
       type: 'crop_apply',
       ts: Date.now(),
       snapshot: {
@@ -1213,7 +1718,7 @@ btnApplyCropToPage.addEventListener('click', async () => {
       },
     });
 
-    btnToggleCrop.click();
+    exitCropModeInternal({ revertDraft: false });
 
     await renderSidebarThumbnails();
     await renderCurrentPage();
@@ -1247,7 +1752,7 @@ async function applyRotationToCurrentPage() {
       customImageDataUrl: dataUrl
     };
 
-    await savePageHistoryEvent(pageId, {
+    await commitPageHistoryEvent(pageId, {
       type: 'rotate_apply',
       ts: Date.now(),
       snapshot: {
@@ -1322,6 +1827,9 @@ function deletePage(index) {
   showToast('Page deleted.', 'info');
 
   if (removedPageId) {
+    pageHistoryEventsMap.delete(removedPageId);
+    pageHistoryPointerMap.delete(removedPageId);
+    pageHistoryBaselineMap.delete(removedPageId);
     void deletePageHistory(removedPageId).catch(() => {});
   }
 }
@@ -1413,12 +1921,77 @@ btnNextPage.addEventListener('click', () => {
   goToNextPage();
 });
 
+if (btnUndoPage) {
+  btnUndoPage.addEventListener('click', () => {
+    void undoOnCurrentPage();
+  });
+}
+
+if (btnRedoPage) {
+  btnRedoPage.addEventListener('click', () => {
+    void redoOnCurrentPage();
+  });
+}
+
+if (btnShowShortcuts) {
+  btnShowShortcuts.addEventListener('click', () => {
+    if (isShortcutsModalOpen) closeShortcutsModal();
+    else openShortcutsModal();
+  });
+}
+
 currentPageNum.addEventListener('input', schedulePageInputNavigation);
 
 document.addEventListener('keydown', (e) => {
+  // Modal shortcut handling (Esc/Enter) - 입력창 포커스 여부와 무관하게 동작
+  if (isConfirmCropExitModalOpen) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      if (confirmCropExitResolve) confirmCropExitResolve(false);
+      closeConfirmCropExitModal();
+      return;
+    }
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (confirmCropExitResolve) confirmCropExitResolve(true);
+      closeConfirmCropExitModal();
+      return;
+    }
+    return;
+  }
+
+  if (isShortcutsModalOpen) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      closeShortcutsModal();
+    }
+    return;
+  }
+
   if (isKeyboardInputTarget(e.target)) return;
+
+  // crop 모드 토글(c)
+  if (e.key === 'c' || e.key === 'C') {
+    if (pageList.length === 0 || currentPageIndex < 0) return;
+    e.preventDefault();
+    if (!isCropMode) {
+      enterCropMode();
+    } else {
+      void attemptExitCropModeWithConfirm();
+    }
+    return;
+  }
+
   if (pageList.length === 0 || currentPageIndex < 0) return;
   if (!loadingOverlay.classList.contains('hidden')) return;
+
+  if (handleCropShortcut(e)) {
+    return;
+  }
+
+  if (handleRotationShortcut(e)) {
+    return;
+  }
 
   if (e.key === 'ArrowLeft') {
     e.preventDefault();
@@ -1464,12 +2037,99 @@ btnCopyClipboard.addEventListener('click', async () => {
   }
 });
 
-async function renderPageToCanvas(item, scale = 2.0) {
-  const offCanvas = document.createElement('canvas');
-  const ctx = offCanvas.getContext('2d');
+async function renderPageToCanvas(item, scale = 2.0, reuseCanvas = null) {
   const deg = normalizeRotation(item.rotation);
   const rad = (deg * Math.PI) / 180;
 
+  // 재사용 캔버스 모드(내보내기에서 단일 캔버스 재사용용)
+  if (reuseCanvas) {
+    const ctx = reuseCanvas.getContext('2d');
+    if (!ctx) throw new Error('Failed to get 2D context from reuseCanvas.');
+
+    let srcW = 0;
+    let srcH = 0;
+
+    if (item.customImageDataUrl) {
+      const img = await loadImage(item.customImageDataUrl);
+      reuseCanvas.width = img.width;
+      reuseCanvas.height = img.height;
+      ctx.clearRect(0, 0, img.width, img.height);
+      ctx.drawImage(img, 0, 0);
+      srcW = img.width;
+      srcH = img.height;
+    } else {
+      const page = await getPdfPageCached(item.originalPageIndex);
+      const viewport = page.getViewport({ scale });
+      reuseCanvas.width = viewport.width;
+      reuseCanvas.height = viewport.height;
+      ctx.clearRect(0, 0, viewport.width, viewport.height);
+
+      const renderTaskCtx = reuseCanvas.getContext('2d');
+      let renderTask = null;
+      try {
+        renderTask = page.render({ canvasContext: renderTaskCtx, viewport });
+        await renderTask.promise;
+      } catch (err) {
+        if (renderTask && typeof renderTask.cancel === 'function') {
+          try {
+            renderTask.cancel();
+          } catch (_e) {}
+        }
+        throw err;
+      } finally {
+        renderTask = null;
+      }
+
+      srcW = viewport.width;
+      srcH = viewport.height;
+    }
+
+    if (deg === 0) return reuseCanvas;
+
+    // 회전 시, 캔버스 리사이즈 전에 현재 내용을 비트맵으로 보존
+    const sin = Math.abs(Math.sin(rad));
+    const cos = Math.abs(Math.cos(rad));
+
+    let bitmap = null;
+    try {
+      bitmap = await createImageBitmap(reuseCanvas);
+    } catch (_e) {
+      // createImageBitmap 미지원/실패 시 fallback
+      const img = new Image();
+      img.src = reuseCanvas.toDataURL('image/png');
+      await img.decode();
+      bitmap = img;
+    }
+
+    const newW = Math.round(srcW * cos + srcH * sin);
+    const newH = Math.round(srcW * sin + srcH * cos);
+
+    reuseCanvas.width = newW;
+    reuseCanvas.height = newH;
+
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, newW, newH);
+
+    ctx.translate(newW / 2, newH / 2);
+    ctx.rotate(rad);
+    ctx.drawImage(bitmap, -srcW / 2, -srcH / 2);
+
+    // 리사이즈/그림 이후 변환 상태 초기화
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+
+    if (bitmap && typeof bitmap.close === 'function') {
+      try {
+        bitmap.close();
+      } catch (_e) {}
+    }
+
+    return reuseCanvas;
+  }
+
+  // 기존(호환) 모드
+  const offCanvas = document.createElement('canvas');
+  const ctx = offCanvas.getContext('2d');
   let srcCanvas;
 
   if (item.customImageDataUrl) {
@@ -1556,17 +2216,50 @@ function resizeAndDrawToReusableCanvas(sourceCanvas, targetCanvas, targetCtx, ma
   targetCtx.drawImage(sourceCanvas, 0, 0, w, h);
 }
 
-function canvasToJpegBlob(canvas, quality) {
+function canvasToJpegBlob(canvas, quality, mime = 'image/jpeg') {
   return new Promise((resolve, reject) => {
     canvas.toBlob(
       (blob) => {
         if (!blob) return reject(new Error('Failed to create JPEG blob.'));
         resolve(blob);
       },
-      'image/jpeg',
+      mime,
       quality
     );
   });
+}
+
+async function downscaleCanvasInPlace(canvas, maxDimension) {
+  if (!canvas) return;
+  if (canvas.width <= maxDimension && canvas.height <= maxDimension) return;
+
+  const srcW = canvas.width;
+  const srcH = canvas.height;
+  const { w, h } = getScaledSize(srcW, srcH, maxDimension);
+
+  let bitmap = null;
+  try {
+    bitmap = await createImageBitmap(canvas);
+  } catch (_e) {
+    // fallback: dataURL -> Image
+    const img = new Image();
+    img.src = canvas.toDataURL('image/png');
+    await img.decode();
+    bitmap = img;
+  }
+
+  canvas.width = w;
+  canvas.height = h;
+
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, w, h);
+  ctx.drawImage(bitmap, 0, 0, w, h);
+
+  if (bitmap && typeof bitmap.close === 'function') {
+    try {
+      bitmap.close();
+    } catch (_e) {}
+  }
 }
 
 async function renderFullPageToCanvasForExport(item) {
@@ -1587,73 +2280,89 @@ btnExportPdf.addEventListener('click', async () => {
 
   showExportToast('PDF 생성 중...');
   try {
-    const pdfDocOutput = await PDFDocument.create();
-    const encodeCanvas = document.createElement('canvas');
-    const encodeCtx = encodeCanvas.getContext('2d');
-    if (!encodeCtx) throw new Error('Failed to create canvas context for export.');
+    // OOM 방지: 모든 페이지를 한 PDF에 누적 임베딩하지 않고,
+    // chunk 단위로 임베딩+저장한 뒤 마지막에 합치는 방식으로 메모리를 낮춥니다.
+    const workCanvas = document.createElement('canvas');
+    const workCtx = workCanvas.getContext('2d');
+    if (!workCtx) throw new Error('Failed to create canvas context for export.');
 
     const PAGE_CHUNK_SIZE = 50;
+    const chunkPdfBytesList = [];
+
     for (let chunkStart = 0; chunkStart < pageList.length; chunkStart += PAGE_CHUNK_SIZE) {
       const chunkEnd = Math.min(pageList.length, chunkStart + PAGE_CHUNK_SIZE);
 
+      updateExportToast(`PDF 청크 생성 중 (${chunkStart + 1}-${chunkEnd}/${pageList.length})...`);
+
+      const chunkDoc = await PDFDocument.create();
+      const useWebp = typeof chunkDoc.embedWebp === 'function';
+      const mime = useWebp ? 'image/webp' : 'image/jpeg';
+
       for (let i = chunkStart; i < chunkEnd; i++) {
         const item = pageList[i];
-        updateExportToast(`페이지 처리 중 (${i + 1}/${pageList.length})...`);
-
-        const renderedCanvas = await renderFullPageToCanvasForExport(item);
+        updateExportToast(`청크 처리 중 (${i + 1}/${pageList.length})...`);
 
         try {
-          // 인코딩 단계용 단일 캔버스 재사용
-          resizeAndDrawToReusableCanvas(
-            renderedCanvas,
-            encodeCanvas,
-            encodeCtx,
-            EXPORT_MAX_CANVAS_DIMENSION
-          );
+          await renderPageToCanvas(item, EXPORT_RENDER_SCALE, workCanvas);
+          await downscaleCanvasInPlace(workCanvas, EXPORT_MAX_CANVAS_DIMENSION);
 
-          let jpgImage = null;
+          let imgObj = null;
           try {
-            const blob = await canvasToJpegBlob(encodeCanvas, EXPORT_JPEG_QUALITY);
+            const blob = await canvasToJpegBlob(workCanvas, EXPORT_JPEG_QUALITY, mime);
             const bytes = new Uint8Array(await blob.arrayBuffer());
-            jpgImage = await pdfDocOutput.embedJpg(bytes);
+            imgObj = useWebp ? await chunkDoc.embedWebp(bytes) : await chunkDoc.embedJpg(bytes);
           } catch (_e) {
-            // fallback: embedJpg가 bytes 입력을 못 받는 환경 대응
-            const dataUrl = encodeCanvas.toDataURL('image/jpeg', EXPORT_JPEG_QUALITY);
-            jpgImage = await pdfDocOutput.embedJpg(dataUrl);
+            // webp/bytes fallback: jpeg/dataURL
+            const dataUrl = workCanvas.toDataURL('image/jpeg', EXPORT_JPEG_QUALITY);
+            imgObj = await chunkDoc.embedJpg(dataUrl);
           }
 
-          const page = pdfDocOutput.addPage([jpgImage.width, jpgImage.height]);
-          page.drawImage(jpgImage, {
+          const page = chunkDoc.addPage([imgObj.width, imgObj.height]);
+          page.drawImage(imgObj, {
             x: 0,
             y: 0,
-            width: jpgImage.width,
-            height: jpgImage.height,
+            width: imgObj.width,
+            height: imgObj.height,
           });
         } finally {
-          // Render/Ctx 참조 끊기(즉시 메모리 해제 유도)
           try {
-            renderedCanvas.width = 0;
-            renderedCanvas.height = 0;
-          } catch (_e) {}
-          try {
-            encodeCanvas.width = 0;
-            encodeCanvas.height = 0;
+            workCanvas.width = 0;
+            workCanvas.height = 0;
           } catch (_e) {}
         }
       }
 
-      // 이벤트 루프/GC 타임 확보 + 내부 정리(가능할 때만)
+      // 청크 저장
       await new Promise((r) => setTimeout(r, 10));
-      if (typeof pdfDocOutput.cleanup === 'function') {
+      if (typeof chunkDoc.cleanup === 'function') {
         try {
-          await pdfDocOutput.cleanup();
+          await chunkDoc.cleanup();
+        } catch (_e) {}
+      }
+
+      const chunkBytes = await chunkDoc.save({ useObjectStreams: true });
+      chunkPdfBytesList.push(chunkBytes);
+    }
+
+    // 청크 PDF 합치기
+    updateExportToast('PDF 병합 중...');
+    const finalDoc = await PDFDocument.create();
+
+    for (let i = 0; i < chunkPdfBytesList.length; i++) {
+      updateExportToast(`PDF 병합 중 (${i + 1}/${chunkPdfBytesList.length})...`);
+      const chunkDoc = await PDFDocument.load(chunkPdfBytesList[i]);
+      const indices = chunkDoc.getPageIndices();
+      const copiedPages = await finalDoc.copyPages(chunkDoc, indices);
+      copiedPages.forEach((p) => finalDoc.addPage(p));
+
+      if (typeof chunkDoc.cleanup === 'function') {
+        try {
+          await chunkDoc.cleanup();
         } catch (_e) {}
       }
     }
 
-    updateExportToast('PDF 저장 중...');
-
-    const pdfBytes = await pdfDocOutput.save({ useObjectStreams: true });
+    const pdfBytes = await finalDoc.save({ useObjectStreams: true });
 
     const suggestedName = originalFileName || 'edited_document.pdf';
     const outBlob = new Blob([pdfBytes], { type: 'application/pdf' });
