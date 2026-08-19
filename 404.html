@@ -9,8 +9,8 @@
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
   <!-- Tailwind CSS (CDN) -->
   
-  <script type="module" crossorigin src="/pdf-rotate-crop/assets/index-Bf7YPrxk.js"></script>
-  <link rel="stylesheet" crossorigin href="/pdf-rotate-crop/assets/index-8ymMXVfb.css">
+  <script type="module" crossorigin src="/pdf-rotate-crop/assets/index-CVU4IOTf.js"></script>
+  <link rel="stylesheet" crossorigin href="/pdf-rotate-crop/assets/index-C4hajnsX.css">
 </head>
 <body class="bg-slate-100 h-[100dvh] flex flex-col overflow-hidden text-slate-800">
 
@@ -33,7 +33,7 @@
       <label class="cursor-pointer bg-slate-800 hover:bg-slate-700 text-slate-200 hover:text-white px-3 py-2 rounded-lg text-sm font-medium transition flex items-center gap-2 border border-slate-700">
         <i class="fa-solid fa-folder-open text-blue-400"></i>
         <span class="hidden sm:inline">PDF 열기</span>
-        <input type="file" id="pdfFileInput" accept="application/pdf" class="hidden" />
+      <input type="file" id="pdfFileInput" accept="application/pdf,.pdfedit,.pdfedit.gz" class="hidden" />
       </label>
 
       <button id="btnCopyClipboard" class="opacity-50 cursor-not-allowed bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-2 rounded-lg text-sm font-medium transition flex items-center gap-2 border border-slate-700" disabled>
@@ -44,6 +44,36 @@
       <button id="btnExportPdf" class="opacity-50 cursor-not-allowed bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg text-sm font-medium transition flex items-center gap-2 shadow-sm" disabled>
         <i class="fa-solid fa-download"></i>
         <span>새 PDF 저장</span>
+      </button>
+
+      <button id="btnExportProject" class="opacity-50 cursor-not-allowed bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-2 rounded-lg text-sm font-medium transition flex items-center gap-2 border border-slate-700" disabled title="원본 PDF + 편집 상태(프로젝트) 저장">
+        <i class="fa-solid fa-file-zipper"></i>
+        <span class="hidden sm:inline">프로젝트 저장</span>
+      </button>
+
+      <button id="btnCloseProject" class="opacity-50 cursor-not-allowed bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-2 rounded-lg text-sm font-medium transition flex items-center gap-2 border border-slate-700" disabled title="열려 있는 프로젝트 닫기(IndexedDB는 유지)">
+        <i class="fa-solid fa-xmark"></i>
+        <span class="hidden sm:inline">닫기</span>
+      </button>
+
+      <button id="btnDeleteProject" class="opacity-50 cursor-not-allowed bg-rose-600 hover:bg-rose-500 text-white px-3 py-2 rounded-lg text-sm font-medium transition flex items-center gap-2 shadow-sm" disabled title="프로젝트 삭제(IndexedDB)">
+        <i class="fa-solid fa-trash"></i>
+        <span class="hidden sm:inline">삭제</span>
+      </button>
+
+      <button id="btnShowShortcuts" class="bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-2 rounded-lg text-sm font-medium transition flex items-center gap-2 border border-slate-700" title="단축키 보기">
+        <i class="fa-solid fa-keyboard"></i>
+        <span class="hidden sm:inline">단축키</span>
+      </button>
+
+      <button id="btnUndoPage" class="opacity-50 cursor-not-allowed bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-2 rounded-lg text-sm font-medium transition flex items-center gap-2 border border-slate-700" disabled title="이전(Undo)">
+        <i class="fa-solid fa-arrow-rotate-left text-blue-400"></i>
+        <span class="hidden sm:inline">Undo</span>
+      </button>
+
+      <button id="btnRedoPage" class="opacity-50 cursor-not-allowed bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-2 rounded-lg text-sm font-medium transition flex items-center gap-2 border border-slate-700" disabled title="다음(Redo)">
+        <i class="fa-solid fa-arrow-rotate-right text-blue-400"></i>
+        <span class="hidden sm:inline">Redo</span>
       </button>
     </div>
   </header>
@@ -178,6 +208,15 @@
           <span class="inline-block bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold px-4 py-2 rounded-lg transition">
             파일 탐색기 열기
           </span>
+
+          <div class="mt-4 flex flex-col sm:flex-row gap-2">
+            <button id="btnRestoreRecentSession" disabled class="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-medium transition disabled:opacity-50 disabled:cursor-not-allowed">
+              최근 작업 복구하기
+            </button>
+            <button id="btnClearRecentSession" disabled class="px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-xs font-medium transition disabled:opacity-50 disabled:cursor-not-allowed">
+              최근 작업 상태 삭제
+            </button>
+          </div>
         </div>
 
         <!-- Canvas Wrapper for PDF Rendering & Crop Box Overlay -->
