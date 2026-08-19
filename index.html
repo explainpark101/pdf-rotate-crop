@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PDF Page Editor</title>
+  
+  <!-- FontAwesome Icons -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <!-- Tailwind CSS (CDN) -->
+  
+  <script type="module" crossorigin src="/pdf-rotate-crop/assets/index-Bf7YPrxk.js"></script>
+  <link rel="stylesheet" crossorigin href="/pdf-rotate-crop/assets/index-8ymMXVfb.css">
+</head>
+<body class="bg-slate-100 h-[100dvh] flex flex-col overflow-hidden text-slate-800">
+
+  <!-- Header Section -->
+  <header class="bg-slate-900 text-white px-5 py-3 flex items-center justify-between shadow-md z-20">
+    <div class="flex items-center space-x-3">
+      <div class="bg-blue-600 text-white p-2 rounded-lg flex items-center justify-center">
+        <i class="fa-solid fa-file-pdf text-xl"></i>
+      </div>
+      <div>
+        <h1 class="font-bold text-lg leading-tight flex items-center gap-2">
+          PDF Page Editor
+          <span id="docName" class="text-xs font-normal text-slate-400 max-w-[200px] sm:max-w-xs truncate block">파일을 선택해주세요</span>
+        </h1>
+      </div>
+    </div>
+
+    <!-- Action Buttons -->
+    <div class="flex items-center space-x-2 sm:space-x-3">
+      <label class="cursor-pointer bg-slate-800 hover:bg-slate-700 text-slate-200 hover:text-white px-3 py-2 rounded-lg text-sm font-medium transition flex items-center gap-2 border border-slate-700">
+        <i class="fa-solid fa-folder-open text-blue-400"></i>
+        <span class="hidden sm:inline">PDF 열기</span>
+        <input type="file" id="pdfFileInput" accept="application/pdf" class="hidden" />
+      </label>
+
+      <button id="btnCopyClipboard" class="opacity-50 cursor-not-allowed bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-2 rounded-lg text-sm font-medium transition flex items-center gap-2 border border-slate-700" disabled>
+        <i class="fa-regular fa-copy text-emerald-400"></i>
+        <span class="hidden sm:inline">이미지 복사</span>
+      </button>
+
+      <button id="btnExportPdf" class="opacity-50 cursor-not-allowed bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg text-sm font-medium transition flex items-center gap-2 shadow-sm" disabled>
+        <i class="fa-solid fa-download"></i>
+        <span>새 PDF 저장</span>
+      </button>
+    </div>
+  </header>
+
+  <div class="flex-1 flex overflow-hidden relative min-h-0">
+    
+    <!-- LEFT SIDEBAR: Thumbnails & Page Management -->
+    <aside id="sidebar" class="w-64 bg-white border-r border-slate-200 flex flex-col z-10 shadow-sm transition-all duration-300">
+      <div class="p-3 border-b border-slate-100 flex items-center justify-between bg-slate-50">
+        <span class="text-xs font-semibold text-slate-500 uppercase tracking-wider flex items-center gap-1.5">
+          <i class="fa-solid fa-layer-group text-slate-400"></i> 페이지 목록 (<span id="pageCount">0</span>)
+        </span>
+        <span class="text-xs text-slate-400">순서 변경 가능</span>
+      </div>
+
+      <!-- Thumbnail List Container -->
+      <div id="thumbnailContainer" class="flex-1 overflow-y-auto p-3 relative min-h-0">
+        <!-- Empty State -->
+        <div id="emptySidebarState" class="h-full flex flex-col items-center justify-center text-center p-4 text-slate-400">
+          <i class="fa-solid fa-file-circle-plus text-3xl mb-2 text-slate-300"></i>
+          <p class="text-xs">PDF 파일을 로드하여<br>페이지를 확인하세요.</p>
+        </div>
+      </div>
+    </aside>
+
+    <!-- MAIN EDITING AREA -->
+    <main class="flex-1 flex flex-col bg-slate-200/70 overflow-hidden relative min-h-0">
+      
+      <!-- Toolbar controls -->
+      <div id="editorToolbar" class="bg-white border-b border-slate-200 px-4 py-2 flex flex-wrap items-center justify-between gap-3 shadow-xs z-10 hidden">
+        <!-- Left Toolset: Page Nav -->
+        <div class="flex items-center space-x-2">
+          <button id="btnPrevPage" class="p-1.5 rounded hover:bg-slate-100 text-slate-600 disabled:opacity-30 disabled:hover:bg-transparent" title="이전 페이지">
+            <i class="fa-solid fa-chevron-left text-sm"></i>
+          </button>
+          <span class="text-sm font-medium text-slate-700 flex items-center gap-1">
+            <input type="number" id="currentPageNum" min="1" value="0" class="w-10 text-center text-sm font-medium text-slate-700 bg-white border border-slate-200 rounded py-0.5 focus:outline-none focus:border-blue-500 disabled:opacity-50 disabled:cursor-not-allowed" disabled title="페이지 번호 입력">
+            <span>/ <span id="totalPagesNum">0</span></span>
+          </span>
+          <button id="btnNextPage" class="p-1.5 rounded hover:bg-slate-100 text-slate-600 disabled:opacity-30 disabled:hover:bg-transparent" title="다음 페이지">
+            <i class="fa-solid fa-chevron-right text-sm"></i>
+          </button>
+        </div>
+
+        <div class="h-4 w-[1px] bg-slate-300 hidden sm:block"></div>
+
+        <!-- Middle Toolset: 360 Degree Precision Rotation Controls -->
+        <div class="flex items-center space-x-1 sm:space-x-2">
+          <span class="text-xs font-semibold text-slate-500 hidden md:flex items-center gap-1">
+            <i class="fa-solid fa-rotate text-blue-500"></i> 회전:
+          </span>
+          <button id="btnRotateCcw30" class="p-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded text-xs font-medium transition" title="시계 반대방향 30도 회전">
+            -30°
+          </button>
+          <button id="btnRotateCcw1" class="p-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded text-xs font-medium transition" title="시계 반대방향 1도 회전">
+            -1°
+          </button>
+          <button id="btnRotateCcw01" class="p-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded text-xs font-medium transition" title="시계 반대방향 0.1도 회전">
+            -0.1°
+          </button>
+          
+          <!-- Rotation Slider -180 to 180 degrees & Direct 0.1° Input -->
+          <div class="flex items-center space-x-1 bg-slate-50 border border-slate-200 px-2 py-1 rounded-lg">
+            <input type="range" id="rotationRange" min="-180" max="180" value="0" step="0.1" class="w-16 sm:w-24 accent-blue-600 cursor-pointer">
+            <input type="number" id="rotationInput" min="-180" max="180" value="0" step="0.1" class="w-14 text-center text-xs font-mono font-bold text-blue-600 bg-white border border-slate-200 rounded py-0.5 focus:outline-none focus:border-blue-500">
+            <span class="text-xs font-bold text-blue-600">°</span>
+          </div>
+
+          <button id="btnRotateCw01" class="p-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded text-xs font-medium transition" title="시계방향 0.1도 회전">
+            +0.1°
+          </button>
+          <button id="btnRotateCw1" class="p-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded text-xs font-medium transition" title="시계방향 1도 회전">
+            +1°
+          </button>
+          <button id="btnRotateCw30" class="p-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded text-xs font-medium transition" title="시계방향 30도 회전">
+            +30°
+          </button>
+          <button id="btnResetRotate" class="p-1.5 hover:bg-slate-100 text-slate-400 hover:text-slate-600 rounded text-xs" title="회전 초기화">
+            <i class="fa-solid fa-arrow-rotate-left"></i>
+          </button>
+          <button id="btnApplyRotationToPage" class="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-xs font-medium transition flex items-center gap-1.5 shadow-xs opacity-50 cursor-not-allowed" title="회전을 현재 페이지에 적용" disabled>
+            <i class="fa-solid fa-check"></i>
+            <span>회전 적용</span>
+          </button>
+        </div>
+
+        <div class="h-4 w-[1px] bg-slate-300 hidden sm:block"></div>
+
+        <!-- Right Toolset: Crop & Delete Actions -->
+        <div class="flex items-center space-x-2">
+          <button id="btnToggleCrop" class="px-3 py-1.5 bg-slate-100 hover:bg-blue-50 text-slate-700 border border-slate-200 rounded-lg text-xs font-medium transition flex items-center gap-1.5">
+            <i class="fa-solid fa-crop text-blue-600"></i>
+            <span id="cropBtnText">영역 크롭 모드</span>
+          </button>
+
+          <div id="cropPresetGroup" class="hidden items-center gap-1">
+            <span class="text-xs text-slate-500 hidden md:inline">프리셋:</span>
+            <button data-crop-preset="leftHalf" class="px-2 py-1 bg-slate-100 hover:bg-blue-50 text-slate-700 border border-slate-200 rounded text-xs font-medium transition">
+              왼쪽 절반
+            </button>
+            <button data-crop-preset="center80" class="px-2 py-1 bg-slate-100 hover:bg-blue-50 text-slate-700 border border-slate-200 rounded text-xs font-medium transition">
+              중앙 80%
+            </button>
+          </div>
+
+          <button id="btnApplyCropToPage" class="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-xs font-medium transition hidden flex items-center gap-1.5 shadow-xs">
+            <i class="fa-solid fa-check"></i>
+            <span>현재 페이지에 적용</span>
+          </button>
+
+          <button id="btnAddCroppedPage" class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-medium transition hidden flex items-center gap-1.5 shadow-xs">
+            <i class="fa-solid fa-plus-circle"></i>
+            <span>새 페이지로 추가</span>
+          </button>
+
+          <button id="btnDeleteCurrentPage" class="px-3 py-1.5 bg-rose-50 hover:bg-rose-100 text-rose-600 border border-rose-200 rounded-lg text-xs font-medium transition flex items-center gap-1">
+            <i class="fa-solid fa-trash-can"></i>
+            <span>페이지 삭제</span>
+          </button>
+        </div>
+      </div>
+
+      <div id="viewportContainer" class="flex-1 overflow-auto p-6 flex items-center justify-center relative min-h-0">
+        
+        <!-- Welcome Dropzone Area -->
+        <div id="dropzone" class="max-w-md w-full bg-white border-2 border-dashed border-slate-300 hover:border-blue-500 rounded-2xl p-8 text-center cursor-pointer transition shadow-sm">
+          <div class="w-16 h-16 bg-blue-50 text-blue-600 rounded-full flex items-center justify-center mx-auto mb-4">
+            <i class="fa-solid fa-cloud-arrow-up text-2xl"></i>
+          </div>
+          <h2 class="text-lg font-bold text-slate-800 mb-1">PDF 파일 선택 또는 드롭</h2>
+          <p class="text-xs text-slate-500 mb-4">컴퓨터에서 편집할 PDF 문서를 불러오세요.</p>
+          <span class="inline-block bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold px-4 py-2 rounded-lg transition">
+            파일 탐색기 열기
+          </span>
+        </div>
+
+        <!-- Canvas Wrapper for PDF Rendering & Crop Box Overlay -->
+        <div id="canvasWrapper" class="relative hidden shadow-2xl rounded-sm bg-white overflow-visible transition-all">
+          <div id="canvasLoader" class="absolute inset-0 bg-white/90 flex items-center justify-center z-10 hidden rounded-sm">
+            <div class="flex items-center space-x-2 bg-slate-800 text-white px-3.5 py-2 rounded-xl text-xs font-medium shadow-lg">
+              <i class="fa-solid fa-circle-notch fa-spin text-blue-400 text-sm"></i>
+              <span>페이지 불러오는 중...</span>
+            </div>
+          </div>
+
+          <canvas id="pdfCanvas" class="block rounded-sm max-h-[calc(100dvh-8rem)]"></canvas>
+          
+          <!-- Crop Overlay Box -->
+          <div id="cropOverlay" class="absolute border-2 border-blue-500 bg-blue-500/10 hidden cursor-move z-20">
+            <div class="crop-handle nw"></div>
+            <div class="crop-handle ne"></div>
+            <div class="crop-handle sw"></div>
+            <div class="crop-handle se"></div>
+            <div class="crop-handle n"></div>
+            <div class="crop-handle s"></div>
+            <div class="crop-handle w"></div>
+            <div class="crop-handle e"></div>
+            <!-- Dimension Label -->
+            <div id="cropSizeLabel" class="absolute -top-7 left-0 bg-blue-600 text-white text-[10px] font-mono px-1.5 py-0.5 rounded shadow pointer-events-none whitespace-nowrap">
+              0 x 0
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </main>
+
+  </div>
+
+  <!-- Toast Container -->
+  <div id="toastContainer" class="fixed bottom-5 right-5 z-50 flex flex-col space-y-2 pointer-events-none"></div>
+
+  <!-- Loading Overlay Dialog -->
+  <div id="loadingOverlay" class="fixed inset-0 bg-slate-900/60 backdrop-blur-xs flex flex-col items-center justify-center z-50 hidden text-white">
+    <div class="bg-slate-800 border border-slate-700 rounded-2xl p-6 flex flex-col items-center space-y-4 shadow-xl max-w-xs text-center">
+      <i class="fa-solid fa-circle-notch fa-spin text-3xl text-blue-500"></i>
+      <div>
+        <h3 id="loadingTitle" class="font-bold text-base">처리 중입니다...</h3>
+        <p id="loadingSubtitle" class="text-xs text-slate-400 mt-1">잠시만 기다려 주세요.</p>
+      </div>
+    </div>
+  </div>
+
+</body>
