@@ -2641,6 +2641,29 @@ btnExportPdf.addEventListener('click', async () => {
 
   showExportToast('PDF 생성 중...');
   try {
+    const suggestedName = originalFileName || 'edited_document.pdf';
+    let fileHandle: FileSystemFileHandle | null = null;
+
+    // File System Access API는 showSaveFilePicker 호출 시점에 사용자 제스처가 필요합니다.
+    // 그래서 "PDF 바이트를 만드는 무거운 await" 전에 먼저 파일 핸들을 확보합니다.
+    if (window.showSaveFilePicker) {
+      showToast('저장을 위해 File System Access API를 사용합니다.', 'info');
+      try {
+        fileHandle = await window.showSaveFilePicker({
+          suggestedName,
+          types: [{ description: 'PDF', accept: { 'application/pdf': ['.pdf'] } }],
+        });
+      } catch (err: any) {
+        // 사용자가 저장 창을 취소한 경우
+        if (err?.name === 'AbortError') {
+          hideExportToast();
+          showToast('저장이 취소되었습니다.', 'info');
+          return;
+        }
+        throw err;
+      }
+    }
+
     // OOM 방지: 모든 페이지를 한 PDF에 누적 임베딩하지 않고,
     // chunk 단위로 임베딩+저장한 뒤 마지막에 합치는 방식으로 메모리를 낮춥니다.
     const workCanvas = document.createElement('canvas');
@@ -2724,18 +2747,11 @@ btnExportPdf.addEventListener('click', async () => {
     }
 
     const pdfBytes = await finalDoc.save({ useObjectStreams: true });
-
-    const suggestedName = originalFileName || 'edited_document.pdf';
     const outBlob = new Blob([pdfBytes], { type: 'application/pdf' });
 
-    // File System Access API가 있으면 즉시 디스크 저장(가능한 경우에만)
-    if (window.showSaveFilePicker) {
-      showToast('저장을 위해 File System Access API를 사용합니다.', 'info');
-      const handle = await window.showSaveFilePicker({
-        suggestedName,
-        types: [{ description: 'PDF', accept: { 'application/pdf': ['.pdf'] } }],
-      });
-      const writable = await handle.createWritable();
+    // File System Access API로 선택된 위치에 바로 저장
+    if (fileHandle) {
+      const writable = await fileHandle.createWritable();
       await writable.write(outBlob);
       await writable.close();
     } else {
@@ -2777,6 +2793,33 @@ btnExportProject?.addEventListener('click', async () => {
       .replace(/\.pdf$/i, '')
       .replace(/[^\w.\-]+/g, '_');
 
+    const willTryGzip = typeof CompressionStream !== 'undefined';
+    const outNameForPicker = willTryGzip
+      ? `${suggestedNameBase}.pdfedit.gz`
+      : `${suggestedNameBase}.pdfedit`;
+
+    let fileHandle: FileSystemFileHandle | null = null;
+    if (window.showSaveFilePicker) {
+      showToast('저장을 위해 File System Access API를 사용합니다.', 'info');
+      try {
+        fileHandle = await window.showSaveFilePicker({
+          suggestedName: outNameForPicker,
+          types: [
+            {
+              description: 'PDF Edit Project',
+              accept: { 'application/octet-stream': ['.pdfedit', '.pdfedit.gz'] },
+            },
+          ],
+        });
+      } catch (err: any) {
+        if (err?.name === 'AbortError') {
+          showToast('프로젝트 저장이 취소되었습니다.', 'info');
+          return;
+        }
+        throw err;
+      }
+    }
+
     const project = {
       version: 1,
       createdAt: Date.now(),
@@ -2797,18 +2840,13 @@ btnExportProject?.addEventListener('click', async () => {
     const rawBlob = new Blob([header, jsonBytes, pdfSourceData], { type: 'application/octet-stream' });
 
     const { blob: outBlob, used: usedGzip } = await gzipBlobIfPossible(rawBlob);
-    const outName = usedGzip ? `${suggestedNameBase}.pdfedit.gz` : `${suggestedNameBase}.pdfedit`;
 
-    if (window.showSaveFilePicker) {
-      showToast('저장을 위해 File System Access API를 사용합니다.', 'info');
-      const handle = await window.showSaveFilePicker({
-        suggestedName: outName,
-        types: [{ description: 'PDF Edit Project', accept: { 'application/octet-stream': ['.pdfedit', '.pdfedit.gz'] } }],
-      });
-      const writable = await handle.createWritable();
+    if (fileHandle) {
+      const writable = await fileHandle.createWritable();
       await writable.write(outBlob);
       await writable.close();
     } else {
+      const outName = usedGzip ? `${suggestedNameBase}.pdfedit.gz` : `${suggestedNameBase}.pdfedit`;
       const url = URL.createObjectURL(outBlob);
       const link = document.createElement('a');
       link.href = url;
