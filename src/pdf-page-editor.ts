@@ -44,6 +44,9 @@ const CROP_PRESETS = {
   leftHalf: { x: 0, y: 0, w: 0.5, h: 1 },
   center80: { x: 0.1, y: 0.1, w: 0.8, h: 0.8 },
 };
+
+const PDF_CANVAS_MAX_H_DEFAULT_CLASS = 'max-h-[calc(100dvh-8rem)]';
+const PDF_CANVAS_MAX_H_CROP_CLASS = 'max-h-[calc(100dvh-11rem)]';
 let pageRenderToastEl = null;
 let pageRenderToastTimer = null;
 let exportToastEl = null;
@@ -1010,6 +1013,11 @@ btnToggleCrop.addEventListener('click', () => {
     cropPresetGroup.classList.add('flex');
     btnApplyCropToPage.classList.remove('hidden');
     btnAddCroppedPage.classList.remove('hidden');
+
+    // In crop mode, increase the canvas max height so the overlay is more visible.
+    pdfCanvas.classList.remove(PDF_CANVAS_MAX_H_DEFAULT_CLASS);
+    pdfCanvas.classList.add(PDF_CANVAS_MAX_H_CROP_CLASS);
+
     applyCropPreset('center80');
   } else {
     btnToggleCrop.classList.replace('bg-slate-600', 'bg-slate-100');
@@ -1021,6 +1029,9 @@ btnToggleCrop.addEventListener('click', () => {
     cropPresetGroup.classList.remove('flex');
     btnApplyCropToPage.classList.add('hidden');
     btnAddCroppedPage.classList.add('hidden');
+
+    pdfCanvas.classList.remove(PDF_CANVAS_MAX_H_CROP_CLASS);
+    pdfCanvas.classList.add(PDF_CANVAS_MAX_H_DEFAULT_CLASS);
   }
 });
 
@@ -1475,7 +1486,20 @@ async function renderPageToCanvas(item, scale = 2.0) {
     srcCanvas.width = viewport.width;
     srcCanvas.height = viewport.height;
     const sCtx = srcCanvas.getContext('2d');
-    await page.render({ canvasContext: sCtx, viewport }).promise;
+    let renderTask = null;
+    try {
+      renderTask = page.render({ canvasContext: sCtx, viewport });
+      await renderTask.promise;
+    } catch (err) {
+      if (renderTask && typeof renderTask.cancel === 'function') {
+        try {
+          renderTask.cancel();
+        } catch (_e) {}
+      }
+      throw err;
+    } finally {
+      renderTask = null;
+    }
   }
 
   if (deg === 0) {
@@ -1506,23 +1530,43 @@ async function renderFullPageToCanvas(item) {
 }
 
 // Export용: 출력 PDF 크기를 줄이기 위한 다운스케일/압축 설정
-const EXPORT_RENDER_SCALE = 1.35;
-const EXPORT_JPEG_QUALITY = 0.78;
+const EXPORT_RENDER_SCALE = 1.75;
+// 요청사항: JPEG 품질 1
+const EXPORT_JPEG_QUALITY = 1;
 const EXPORT_MAX_CANVAS_DIMENSION = 1800;
 
-function downscaleCanvasToMaxDimension(canvas, maxDimension) {
-  if (!canvas) return canvas;
-  if (canvas.width <= maxDimension && canvas.height <= maxDimension) return canvas;
+function getScaledSize(width, height, maxDimension) {
+  if (width <= maxDimension && height <= maxDimension) {
+    return { w: width, h: height };
+  }
 
-  const scale = Math.min(maxDimension / canvas.width, maxDimension / canvas.height);
-  const newW = Math.max(1, Math.round(canvas.width * scale));
-  const newH = Math.max(1, Math.round(canvas.height * scale));
+  const scale = Math.min(maxDimension / width, maxDimension / height);
+  const w = Math.max(1, Math.round(width * scale));
+  const h = Math.max(1, Math.round(height * scale));
+  return { w, h };
+}
 
-  const scaled = document.createElement('canvas');
-  scaled.width = newW;
-  scaled.height = newH;
-  scaled.getContext('2d').drawImage(canvas, 0, 0, newW, newH);
-  return scaled;
+function resizeAndDrawToReusableCanvas(sourceCanvas, targetCanvas, targetCtx, maxDimension) {
+  const { w, h } = getScaledSize(sourceCanvas.width, sourceCanvas.height, maxDimension);
+
+  targetCanvas.width = w;
+  targetCanvas.height = h;
+
+  targetCtx.clearRect(0, 0, w, h);
+  targetCtx.drawImage(sourceCanvas, 0, 0, w, h);
+}
+
+function canvasToJpegBlob(canvas, quality) {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(
+      (blob) => {
+        if (!blob) return reject(new Error('Failed to create JPEG blob.'));
+        resolve(blob);
+      },
+      'image/jpeg',
+      quality
+    );
+  });
 }
 
 async function renderFullPageToCanvasForExport(item) {
@@ -1544,38 +1588,94 @@ btnExportPdf.addEventListener('click', async () => {
   showExportToast('PDF 생성 중...');
   try {
     const pdfDocOutput = await PDFDocument.create();
+    const encodeCanvas = document.createElement('canvas');
+    const encodeCtx = encodeCanvas.getContext('2d');
+    if (!encodeCtx) throw new Error('Failed to create canvas context for export.');
 
-    for (let i = 0; i < pageList.length; i++) {
-      const item = pageList[i];
-      updateExportToast(`페이지 처리 중 (${i + 1}/${pageList.length})...`);
+    const PAGE_CHUNK_SIZE = 50;
+    for (let chunkStart = 0; chunkStart < pageList.length; chunkStart += PAGE_CHUNK_SIZE) {
+      const chunkEnd = Math.min(pageList.length, chunkStart + PAGE_CHUNK_SIZE);
 
-      const canvas = await renderFullPageToCanvasForExport(item);
-      const compressedCanvas = downscaleCanvasToMaxDimension(
-        canvas,
-        EXPORT_MAX_CANVAS_DIMENSION
-      );
-      const dataUrl = compressedCanvas.toDataURL('image/jpeg', EXPORT_JPEG_QUALITY);
+      for (let i = chunkStart; i < chunkEnd; i++) {
+        const item = pageList[i];
+        updateExportToast(`페이지 처리 중 (${i + 1}/${pageList.length})...`);
 
-      const jpgImage = await pdfDocOutput.embedJpg(dataUrl);
-      const page = pdfDocOutput.addPage([jpgImage.width, jpgImage.height]);
+        const renderedCanvas = await renderFullPageToCanvasForExport(item);
 
-      page.drawImage(jpgImage, {
-        x: 0,
-        y: 0,
-        width: jpgImage.width,
-        height: jpgImage.height,
-      });
+        try {
+          // 인코딩 단계용 단일 캔버스 재사용
+          resizeAndDrawToReusableCanvas(
+            renderedCanvas,
+            encodeCanvas,
+            encodeCtx,
+            EXPORT_MAX_CANVAS_DIMENSION
+          );
+
+          let jpgImage = null;
+          try {
+            const blob = await canvasToJpegBlob(encodeCanvas, EXPORT_JPEG_QUALITY);
+            const bytes = new Uint8Array(await blob.arrayBuffer());
+            jpgImage = await pdfDocOutput.embedJpg(bytes);
+          } catch (_e) {
+            // fallback: embedJpg가 bytes 입력을 못 받는 환경 대응
+            const dataUrl = encodeCanvas.toDataURL('image/jpeg', EXPORT_JPEG_QUALITY);
+            jpgImage = await pdfDocOutput.embedJpg(dataUrl);
+          }
+
+          const page = pdfDocOutput.addPage([jpgImage.width, jpgImage.height]);
+          page.drawImage(jpgImage, {
+            x: 0,
+            y: 0,
+            width: jpgImage.width,
+            height: jpgImage.height,
+          });
+        } finally {
+          // Render/Ctx 참조 끊기(즉시 메모리 해제 유도)
+          try {
+            renderedCanvas.width = 0;
+            renderedCanvas.height = 0;
+          } catch (_e) {}
+          try {
+            encodeCanvas.width = 0;
+            encodeCanvas.height = 0;
+          } catch (_e) {}
+        }
+      }
+
+      // 이벤트 루프/GC 타임 확보 + 내부 정리(가능할 때만)
+      await new Promise((r) => setTimeout(r, 10));
+      if (typeof pdfDocOutput.cleanup === 'function') {
+        try {
+          await pdfDocOutput.cleanup();
+        } catch (_e) {}
+      }
     }
 
     updateExportToast('PDF 저장 중...');
 
     const pdfBytes = await pdfDocOutput.save({ useObjectStreams: true });
 
-    const blob = new Blob([pdfBytes], { type: 'application/pdf' });
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
-    link.download = originalFileName || 'edited_document.pdf';
-    link.click();
+    const suggestedName = originalFileName || 'edited_document.pdf';
+    const outBlob = new Blob([pdfBytes], { type: 'application/pdf' });
+
+    // File System Access API가 있으면 즉시 디스크 저장(가능한 경우에만)
+    if (window.showSaveFilePicker) {
+      showToast('저장을 위해 File System Access API를 사용합니다.', 'info');
+      const handle = await window.showSaveFilePicker({
+        suggestedName,
+        types: [{ description: 'PDF', accept: { 'application/pdf': ['.pdf'] } }],
+      });
+      const writable = await handle.createWritable();
+      await writable.write(outBlob);
+      await writable.close();
+    } else {
+      const url = URL.createObjectURL(outBlob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = suggestedName;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+    }
 
     hideExportToast();
     showToast('PDF가 성공적으로 다운로드되었습니다.', 'success');
