@@ -30,6 +30,7 @@ let cropStartBox = null;
 let renderSeq = 0;
 let pageRenderToastEl = null;
 let pageRenderToastTimer = null;
+let exportToastEl = null;
 
 /* DOM Elements */
 const pdfFileInput = document.getElementById('pdfFileInput');
@@ -1026,13 +1027,13 @@ function loadImage(src) {
 btnExportPdf.addEventListener('click', async () => {
   if (pageList.length === 0) return;
 
-  showLoading('Generating PDF...', 'Building PDF from current pages.');
+  showExportToast('PDF 생성 중...');
   try {
     const pdfDocOutput = await PDFDocument.create();
 
     for (let i = 0; i < pageList.length; i++) {
       const item = pageList[i];
-      updateLoadingSubtitle(`Processing page (${i + 1}/${pageList.length})...`);
+      updateExportToast(`페이지 처리 중 (${i + 1}/${pageList.length})...`);
 
       const canvas = await renderFullPageToCanvas(item);
       const dataUrl = canvas.toDataURL('image/jpeg', 0.92);
@@ -1048,6 +1049,8 @@ btnExportPdf.addEventListener('click', async () => {
       });
     }
 
+    updateExportToast('PDF 저장 중...');
+
     const pdfBytes = await pdfDocOutput.save();
 
     const blob = new Blob([pdfBytes], { type: 'application/pdf' });
@@ -1056,12 +1059,12 @@ btnExportPdf.addEventListener('click', async () => {
     link.download = originalFileName || 'edited_document.pdf';
     link.click();
 
-    showToast('PDF downloaded successfully!', 'success');
+    hideExportToast();
+    showToast('PDF가 성공적으로 다운로드되었습니다.', 'success');
   } catch (err) {
     console.error('PDF Export Error:', err);
-    showToast('PDF generation failed.', 'error');
-  } finally {
-    hideLoading();
+    hideExportToast();
+    showToast('PDF 생성에 실패했습니다.', 'error');
   }
 });
 
@@ -1096,6 +1099,42 @@ function hidePageLoadingToast() {
 
   const toast = pageRenderToastEl;
   pageRenderToastEl = null;
+  toast.classList.add('opacity-0', 'translate-y-2');
+  setTimeout(() => toast.remove(), 300);
+}
+
+function showExportToast(message) {
+  hideExportToast();
+
+  const toastContainer = document.getElementById('toastContainer');
+  if (!toastContainer) return;
+
+  const toast = document.createElement('div');
+  toast.className =
+    'bg-slate-800 text-white px-4 py-3 rounded-xl shadow-lg flex items-center space-x-3 text-xs font-medium transform transition-all duration-300 translate-y-2 opacity-0 pointer-events-auto';
+  toast.innerHTML =
+    '<i class="fa-solid fa-circle-notch fa-spin text-blue-400 text-sm"></i>' +
+    `<span class="export-toast-message">${message}</span>`;
+
+  toastContainer.appendChild(toast);
+  exportToastEl = toast;
+
+  setTimeout(() => {
+    toast.classList.remove('translate-y-2', 'opacity-0');
+  }, 10);
+}
+
+function updateExportToast(message) {
+  if (!exportToastEl) return;
+  const span = exportToastEl.querySelector('.export-toast-message');
+  if (span) span.textContent = message;
+}
+
+function hideExportToast() {
+  if (!exportToastEl) return;
+
+  const toast = exportToastEl;
+  exportToastEl = null;
   toast.classList.add('opacity-0', 'translate-y-2');
   setTimeout(() => toast.remove(), 300);
 }
