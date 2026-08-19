@@ -112,6 +112,7 @@ const btnNextPage = document.getElementById('btnNextPage');
 const btnUndoPage = document.getElementById('btnUndoPage');
 const btnRedoPage = document.getElementById('btnRedoPage');
 const btnExportPdf = document.getElementById('btnExportPdf');
+const btnExportProject = document.getElementById('btnExportProject');
 const btnShowShortcuts = document.getElementById('btnShowShortcuts');
 const btnCopyClipboard = document.getElementById('btnCopyClipboard');
 const loadingOverlay = document.getElementById('loadingOverlay');
@@ -313,6 +314,10 @@ async function openPdfDocument(arrayBuffer, {
 
   btnExportPdf.disabled = false;
   btnExportPdf.classList.remove('opacity-50', 'cursor-not-allowed');
+  if (btnExportProject) {
+    btnExportProject.disabled = false;
+    btnExportProject.classList.remove('opacity-50', 'cursor-not-allowed');
+  }
   btnCopyClipboard.disabled = false;
   btnCopyClipboard.classList.remove('opacity-50', 'cursor-not-allowed');
 
@@ -2392,6 +2397,75 @@ btnExportPdf.addEventListener('click', async () => {
     console.error('PDF Export Error:', err);
     hideExportToast();
     showToast('PDF 생성에 실패했습니다.', 'error');
+  }
+});
+
+async function gzipBlobIfPossible(blob) {
+  if (typeof CompressionStream === 'undefined') return { blob, used: false };
+  try {
+    const stream = blob.stream().pipeThrough(new CompressionStream('gzip'));
+    const outBlob = await new Response(stream).blob();
+    return { blob: outBlob, used: true };
+  } catch (_e) {
+    return { blob, used: false };
+  }
+}
+
+btnExportProject?.addEventListener('click', async () => {
+  if (pageList.length === 0 || !pdfSourceData) return;
+
+  showLoading('프로젝트 파일 생성 중...', '원본 PDF + 편집 상태를 묶고 있습니다.');
+  try {
+    const suggestedNameBase = (originalFileName || sourceFileName || 'pdf_project')
+      .replace(/\.pdf$/i, '')
+      .replace(/[^\w.\-]+/g, '_');
+
+    const project = {
+      version: 1,
+      createdAt: Date.now(),
+      sourceFileName,
+      originalFileName,
+      currentPageIndex,
+      pageList,
+    };
+
+    const jsonStr = JSON.stringify(project);
+    const jsonBytes = new TextEncoder().encode(jsonStr);
+    const magicBytes = new TextEncoder().encode('PDFPAGEEDIT\0'); // 13 bytes
+
+    const header = new Uint8Array(magicBytes.length + 4);
+    header.set(magicBytes, 0);
+    new DataView(header.buffer).setUint32(magicBytes.length, jsonBytes.length, true);
+
+    const rawBlob = new Blob([header, jsonBytes, pdfSourceData], { type: 'application/octet-stream' });
+
+    const { blob: outBlob, used: usedGzip } = await gzipBlobIfPossible(rawBlob);
+    const outName = usedGzip ? `${suggestedNameBase}.pdfedit.gz` : `${suggestedNameBase}.pdfedit`;
+
+    if (window.showSaveFilePicker) {
+      showToast('저장을 위해 File System Access API를 사용합니다.', 'info');
+      const handle = await window.showSaveFilePicker({
+        suggestedName: outName,
+        types: [{ description: 'PDF Edit Project', accept: { 'application/octet-stream': ['.pdfedit', '.pdfedit.gz'] } }],
+      });
+      const writable = await handle.createWritable();
+      await writable.write(outBlob);
+      await writable.close();
+    } else {
+      const url = URL.createObjectURL(outBlob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = outName;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+    }
+
+    showToast('프로젝트 파일이 성공적으로 다운로드되었습니다.', 'success');
+  } catch (err) {
+    console.error('Project Export Error:', err);
+    showToast('프로젝트 파일 생성에 실패했습니다.', 'error');
+  } finally {
+    hideLoading();
   }
 });
 
