@@ -3180,10 +3180,10 @@ async function clearAllExportSegmentStore() {
 }
 
 async function prepareIndexedDbForExport() {
-  console.debug('[Export]', 'preparing IndexedDB space...');
+  // export 세그먼트 임시 store만 정리합니다. 에디터 세션(자동 저장)은 유지합니다.
+  console.debug('[Export]', 'preparing export segment store...');
   await clearAllExportSegmentStore();
-  await clearEditorSession();
-  console.debug('[Export]', 'IndexedDB space prepared');
+  console.debug('[Export]', 'export segment store prepared');
 }
 
 async function saveExportSegmentBytesWithRetry(sessionId, index, bytes) {
@@ -3192,8 +3192,8 @@ async function saveExportSegmentBytesWithRetry(sessionId, index, bytes) {
   } catch (err) {
     if (err?.name !== 'QuotaExceededError') throw err;
 
-    console.warn('[Export]', `QuotaExceeded on segment ${index + 1}, clearing IndexedDB and retrying`);
-    await prepareIndexedDbForExport();
+    console.warn('[Export]', `QuotaExceeded on segment ${index + 1}, clearing export segments and retrying`);
+    await clearAllExportSegmentStore();
     await saveExportSegmentBytes(sessionId, index, bytes);
   }
 }
@@ -3430,7 +3430,7 @@ btnExportPdf.addEventListener('click', async () => {
     let finalDoc = null;
 
     if (useSegmentedExport) {
-      showToast('대용량 PDF 저장을 위해 IndexedDB 임시 데이터를 정리합니다.', 'info');
+      showToast('export 임시 세그먼트 데이터를 정리합니다.', 'info');
       await prepareIndexedDbForExport();
 
       let segmentDoc = null;
@@ -3619,7 +3619,7 @@ btnExportPdf.addEventListener('click', async () => {
     console.error('PDF Export Error:', err);
     hideExportToast();
     if (err?.name === 'QuotaExceededError') {
-      showToast('브라우저 저장 공간이 부족합니다. IndexedDB를 정리했지만 공간이 부족할 수 있습니다.', 'error');
+      showToast('브라우저 저장 공간이 부족합니다. export 임시 데이터 정리 후에도 공간이 부족할 수 있습니다.', 'error');
     } else {
       showToast('PDF 생성에 실패했습니다.', 'error');
     }
