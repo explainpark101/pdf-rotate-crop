@@ -73,14 +73,29 @@ let pdfSessionDirty = false;
 let sessionNeedsSave = false;
 const SESSION_SAVE_DELAY_MS = 500;
 const PAGE_INDEX_CACHE_PREFIX = 'pdf-editor-page-index:';
-const PAGE_IMAGE_STORAGE_MAX_WIDTH = 1200;
-const PAGE_IMAGE_STORAGE_QUALITY = 0.82;
-const PAGE_IMAGE_STORAGE_RENDER_SCALE = 1.25;
+// 페이지용 저장 이미지 해상도/품질
+// - 이 값이 낮으면 이후 Export(다시 PDF 생성) 시 customImageDataUrl 기반 이미지가 저화질로 고정됩니다.
+// A4 가로 폭(대략): 210mm 를 96dpi 기준으로 px로 환산
+const A4_WIDTH_PX = Math.round((210 / 25.4) * 96);
+const PAGE_IMAGE_STORAGE_MAX_WIDTH_KEY = 'pageStorageMaxWidthPx';
+const PAGE_IMAGE_STORAGE_MAX_WIDTH_DEFAULT = 2500;
+
+let PAGE_IMAGE_STORAGE_MAX_WIDTH = PAGE_IMAGE_STORAGE_MAX_WIDTH_DEFAULT;
+try {
+  const raw = localStorage.getItem(PAGE_IMAGE_STORAGE_MAX_WIDTH_KEY);
+  const parsed = raw != null ? parseInt(raw, 10) : NaN;
+  if (!Number.isNaN(parsed) && parsed > 0) PAGE_IMAGE_STORAGE_MAX_WIDTH = parsed;
+} catch (_e) {}
+// 사용자 설정값이 있더라도 A4 폭 미만이면 강제로 올립니다.
+PAGE_IMAGE_STORAGE_MAX_WIDTH = Math.max(PAGE_IMAGE_STORAGE_MAX_WIDTH, A4_WIDTH_PX);
+const PAGE_IMAGE_STORAGE_QUALITY = 1.0;
+const PAGE_IMAGE_STORAGE_RENDER_SCALE = 2;
 
 /* DOM Elements */
 const pdfFileInput = document.getElementById('pdfFileInput');
 const pdfProjectFileInput = document.getElementById('pdfProjectFileInput');
 const btnOpenProjectFromDropzone = document.getElementById('btnOpenProjectFromDropzone');
+const pageStorageMaxWidthInput = document.getElementById('pageStorageMaxWidthInput');
 const dropzone = document.getElementById('dropzone');
 const canvasWrapper = document.getElementById('canvasWrapper');
 const pdfCanvas = document.getElementById('pdfCanvas');
@@ -321,6 +336,23 @@ btnOpenProjectFromDropzone?.addEventListener('click', (e) => {
   e.stopPropagation();
   pdfProjectFileInput?.click();
 });
+
+// 사용자가 저장 이미지의 최대 가로(px)를 직접 설정할 수 있게 합니다.
+// (단, A4 폭 미만은 강제로 clamp)
+if (pageStorageMaxWidthInput) {
+  pageStorageMaxWidthInput.min = String(A4_WIDTH_PX);
+  pageStorageMaxWidthInput.value = String(PAGE_IMAGE_STORAGE_MAX_WIDTH);
+  pageStorageMaxWidthInput.addEventListener('change', () => {
+    const raw = pageStorageMaxWidthInput.value;
+    const parsed = parseInt(raw, 10);
+    const safe = !Number.isNaN(parsed) && parsed > 0 ? Math.max(parsed, A4_WIDTH_PX) : A4_WIDTH_PX;
+    PAGE_IMAGE_STORAGE_MAX_WIDTH = safe;
+    pageStorageMaxWidthInput.value = String(safe);
+    try {
+      localStorage.setItem(PAGE_IMAGE_STORAGE_MAX_WIDTH_KEY, String(safe));
+    } catch (_e) {}
+  });
+}
 
 dropzone.addEventListener('dragover', (e) => {
   e.preventDefault();
@@ -1042,7 +1074,8 @@ function getMainRenderScale(pdfPage) {
   const maxWidth = Math.max(container.clientWidth - padding, 320);
   const maxHeight = Math.max(container.clientHeight - padding, 240);
   const fitScale = Math.min(maxWidth / baseViewport.width, maxHeight / baseViewport.height);
-  return Math.min(Math.max(fitScale, 0.75), 1.5);
+  // 사용자 화면 렌더 품질을 높여(크롭/회전 시) 결과 이미지의 기준 해상도를 올립니다.
+  return Math.min(Math.max(fitScale, 0.75), 2.0);
 }
 
 function clearPdfCaches() {
@@ -2065,7 +2098,7 @@ async function generateCroppedImageDataUrl() {
   let srcCanvas = pdfCanvas;
 
   if (item.rotation !== 0) {
-    srcCanvas = await renderPageToCanvas(item, 1.5);
+    srcCanvas = await renderPageToCanvas(item, PAGE_IMAGE_STORAGE_RENDER_SCALE);
   }
 
   const srcW = srcCanvas.width;
@@ -2561,7 +2594,9 @@ async function renderFullPageToCanvas(item) {
 const EXPORT_RENDER_SCALE = 1.75;
 // 요청사항: JPEG 품질 1
 const EXPORT_JPEG_QUALITY = 1;
-const EXPORT_MAX_CANVAS_DIMENSION = 1800;
+// Export 시 메모리/성능 절충용 다운스케일 상한
+// - 값이 너무 낮으면 저장된 고해상도 이미지가 다시 줄어들어 품질이 손상됩니다.
+const EXPORT_MAX_CANVAS_DIMENSION = 2400;
 
 function getScaledSize(width, height, maxDimension) {
   if (width <= maxDimension && height <= maxDimension) {

@@ -29,46 +29,95 @@
 
     <!-- Action Buttons -->
     <div class="flex items-center space-x-2 sm:space-x-3">
-      <label class="cursor-pointer bg-slate-800 hover:bg-slate-700 text-slate-200 hover:text-white px-3 py-2 rounded-lg text-sm font-medium transition flex items-center gap-2 border border-slate-700">
-        <i class="fa-solid fa-folder-open text-blue-400"></i>
-        <span class="hidden sm:inline">PDF 열기</span>
-      <input type="file" id="pdfFileInput" accept="application/pdf,.pdfedit,.pdfedit.gz" class="hidden" />
-      </label>
-      <label class="cursor-pointer bg-slate-800 hover:bg-slate-700 text-slate-200 hover:text-white px-3 py-2 rounded-lg text-sm font-medium transition flex items-center gap-2 border border-slate-700">
-        <i class="fa-solid fa-file-zipper text-emerald-400"></i>
-        <span class="hidden sm:inline">프로젝트 열기</span>
-      <input type="file" id="pdfProjectFileInput" accept=".pdfedit,.pdfedit.gz" class="hidden" />
-      </label>
+      <!-- 열기 -->
+      <details class="relative">
+        <summary class="cursor-pointer bg-slate-800 hover:bg-slate-700 text-slate-200 hover:text-white px-3 py-2 rounded-lg text-sm font-medium transition flex items-center gap-2 border border-slate-700">
+          <i class="fa-solid fa-folder-open text-blue-400"></i>
+          <span class="hidden sm:inline">열기</span>
+          <i class="fa-solid fa-chevron-down text-xs ml-auto"></i>
+        </summary>
+        <div class="absolute left-0 top-full mt-2 bg-white border border-slate-200 rounded-lg shadow-lg p-2 w-56 z-50">
+          <label class="cursor-pointer bg-slate-50 hover:bg-slate-100 text-slate-800 px-3 py-2 rounded-lg text-sm font-medium transition flex items-center gap-2 border border-slate-200">
+            <i class="fa-solid fa-file-pdf text-blue-400"></i>
+            <span class="flex-1">PDF 열기</span>
+            <input type="file" id="pdfFileInput" accept="application/pdf,.pdfedit,.pdfedit.gz" class="hidden" />
+          </label>
+          <div class="my-2 h-px bg-slate-200"></div>
+          <label class="cursor-pointer bg-slate-50 hover:bg-slate-100 text-slate-800 px-3 py-2 rounded-lg text-sm font-medium transition flex items-center gap-2 border border-slate-200">
+            <i class="fa-solid fa-file-zipper text-emerald-400"></i>
+            <span class="flex-1">프로젝트 열기</span>
+            <input type="file" id="pdfProjectFileInput" accept=".pdfedit,.pdfedit.gz" class="hidden" />
+          </label>
+        </div>
+      </details>
 
-      <button id="btnCopyClipboard" class="opacity-50 cursor-not-allowed bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-2 rounded-lg text-sm font-medium transition flex items-center gap-2 border border-slate-700" disabled>
-        <i class="fa-regular fa-copy text-emerald-400"></i>
-        <span class="hidden sm:inline">이미지 복사</span>
-      </button>
+      <!-- 저장 -->
+      <details class="relative">
+        <summary class="cursor-pointer bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg text-sm font-medium transition flex items-center gap-2 shadow-sm">
+          <i class="fa-solid fa-download"></i>
+          <span class="hidden sm:inline">저장</span>
+          <i class="fa-solid fa-chevron-down text-xs ml-auto"></i>
+        </summary>
+        <div class="absolute left-0 top-full mt-2 bg-white border border-slate-200 rounded-lg shadow-lg p-2 w-56 z-50 flex flex-col gap-2">
+          <button id="btnExportPdf" class="opacity-50 cursor-not-allowed bg-blue-600 hover:bg-blue-500 text-white px-3 py-2 rounded-lg text-sm font-medium transition flex items-center gap-2 shadow-sm" disabled>
+            <i class="fa-solid fa-download"></i>
+            <span class="flex-1">새 PDF 저장</span>
+          </button>
+          <button id="btnExportProject" class="opacity-50 cursor-not-allowed bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-2 rounded-lg text-sm font-medium transition flex items-center gap-2 border border-slate-700" disabled title="원본 PDF + 편집 상태(프로젝트) 저장">
+            <i class="fa-solid fa-file-zipper"></i>
+            <span class="flex-1">프로젝트 저장</span>
+          </button>
+        </div>
+      </details>
 
-      <button id="btnExportPdf" class="opacity-50 cursor-not-allowed bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg text-sm font-medium transition flex items-center gap-2 shadow-sm" disabled>
-        <i class="fa-solid fa-download"></i>
-        <span>새 PDF 저장</span>
-      </button>
+      <!-- 프로젝트 관리 -->
+      <details class="relative">
+        <summary class="cursor-pointer bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-2 rounded-lg text-sm font-medium transition flex items-center gap-2 border border-slate-700">
+          <i class="fa-solid fa-diagram-project"></i>
+          <span class="hidden sm:inline">프로젝트</span>
+          <i class="fa-solid fa-chevron-down text-xs ml-auto"></i>
+        </summary>
+        <div class="absolute left-0 top-full mt-2 bg-white border border-slate-200 rounded-lg shadow-lg p-2 w-56 z-50 flex flex-col gap-2">
+          <button id="btnCloseProject" class="opacity-50 cursor-not-allowed bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-2 rounded-lg text-sm font-medium transition flex items-center gap-2 border border-slate-700" disabled title="열려 있는 프로젝트 닫기(IndexedDB는 유지)">
+            <i class="fa-solid fa-xmark"></i>
+            <span class="flex-1">현재 프로젝트 닫기</span>
+          </button>
+          <button id="btnDeleteProject" class="opacity-50 cursor-not-allowed bg-rose-600 hover:bg-rose-500 text-white px-3 py-2 rounded-lg text-sm font-medium transition flex items-center gap-2 shadow-sm" disabled title="프로젝트 삭제(IndexedDB)">
+            <i class="fa-solid fa-trash"></i>
+            <span class="flex-1">임시저장 작업 삭제</span>
+          </button>
+        </div>
+      </details>
 
-      <button id="btnExportProject" class="opacity-50 cursor-not-allowed bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-2 rounded-lg text-sm font-medium transition flex items-center gap-2 border border-slate-700" disabled title="원본 PDF + 편집 상태(프로젝트) 저장">
-        <i class="fa-solid fa-file-zipper"></i>
-        <span class="hidden sm:inline">프로젝트 저장</span>
-      </button>
+      <!-- 도구 -->
+      <details class="relative">
+        <summary class="cursor-pointer bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-2 rounded-lg text-sm font-medium transition flex items-center gap-2 border border-slate-700">
+          <i class="fa-solid fa-wrench"></i>
+          <span class="hidden sm:inline">도구</span>
+          <i class="fa-solid fa-chevron-down text-xs ml-auto"></i>
+        </summary>
+        <div class="absolute left-0 top-full mt-2 bg-white border border-slate-200 rounded-lg shadow-lg p-2 w-56 z-50 flex flex-col gap-2">
+          <button id="btnCopyClipboard" class="opacity-50 cursor-not-allowed bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-2 rounded-lg text-sm font-medium transition flex items-center gap-2 border border-slate-700" disabled>
+            <i class="fa-regular fa-copy text-emerald-400"></i>
+            <span class="flex-1">이미지 복사</span>
+          </button>
+          <button id="btnShowShortcuts" class="bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-2 rounded-lg text-sm font-medium transition flex items-center gap-2 border border-slate-700" title="단축키 보기">
+            <i class="fa-solid fa-keyboard"></i>
+            <span class="flex-1">단축키</span>
+          </button>
 
-      <button id="btnCloseProject" class="opacity-50 cursor-not-allowed bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-2 rounded-lg text-sm font-medium transition flex items-center gap-2 border border-slate-700" disabled title="열려 있는 프로젝트 닫기(IndexedDB는 유지)">
-        <i class="fa-solid fa-xmark"></i>
-        <span class="hidden sm:inline">닫기</span>
-      </button>
-
-      <button id="btnDeleteProject" class="opacity-50 cursor-not-allowed bg-rose-600 hover:bg-rose-500 text-white px-3 py-2 rounded-lg text-sm font-medium transition flex items-center gap-2 shadow-sm" disabled title="프로젝트 삭제(IndexedDB)">
-        <i class="fa-solid fa-trash"></i>
-        <span class="hidden sm:inline">삭제</span>
-      </button>
-
-      <button id="btnShowShortcuts" class="bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-2 rounded-lg text-sm font-medium transition flex items-center gap-2 border border-slate-700" title="단축키 보기">
-        <i class="fa-solid fa-keyboard"></i>
-        <span class="hidden sm:inline">단축키</span>
-      </button>
+          <div class="border-t border-slate-200 pt-2 mt-1">
+            <div class="text-[11px] text-slate-600 font-medium mb-1">저장 최대 가로(px)</div>
+            <input
+              id="pageStorageMaxWidthInput"
+              type="number"
+              step="50"
+              class="w-full text-sm bg-white border border-slate-200 rounded px-2 py-1"
+            />
+            <div class="text-[10px] text-slate-400 mt-1">최소 A4 폭 이상</div>
+          </div>
+        </div>
+      </details>
 
       <button id="btnUndoPage" class="opacity-50 cursor-not-allowed bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-2 rounded-lg text-sm font-medium transition flex items-center gap-2 border border-slate-700" disabled title="이전(Undo)">
         <i class="fa-solid fa-arrow-rotate-left text-blue-400"></i>
