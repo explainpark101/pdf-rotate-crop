@@ -184,6 +184,9 @@ let confirmDeleteProjectResolve = null;
 let isConfirmAfterProjectExportModalOpen = false;
 let confirmAfterProjectExportResolve = null;
 
+let isConfirmAlsoSaveProjectModalOpen = false;
+let confirmAlsoSaveProjectResolve = null;
+
 function openShortcutsModal() {
   const el = document.getElementById('shortcutsModal');
   if (!el) return;
@@ -251,6 +254,24 @@ function closeConfirmAfterProjectExportModal() {
   el.classList.add('hidden');
   isConfirmAfterProjectExportModalOpen = false;
   confirmAfterProjectExportResolve = null;
+}
+
+function openConfirmAlsoSaveProjectModal() {
+  const el = document.getElementById('confirmAlsoSaveProjectModal');
+  if (!el) return Promise.resolve(false);
+  el.classList.remove('hidden');
+  isConfirmAlsoSaveProjectModalOpen = true;
+  return new Promise((resolve) => {
+    confirmAlsoSaveProjectResolve = resolve;
+  });
+}
+
+function closeConfirmAlsoSaveProjectModal() {
+  const el = document.getElementById('confirmAlsoSaveProjectModal');
+  if (!el) return;
+  el.classList.add('hidden');
+  isConfirmAlsoSaveProjectModalOpen = false;
+  confirmAlsoSaveProjectResolve = null;
 }
 
 // Create modal DOM once.
@@ -358,6 +379,32 @@ function closeConfirmAfterProjectExportModal() {
     overlay.querySelector('#btnConfirmConfirmAfterProjectExport')?.addEventListener('click', () => {
       if (confirmAfterProjectExportResolve) confirmAfterProjectExportResolve(true);
       closeConfirmAfterProjectExportModal();
+    });
+  }
+
+  if (!document.getElementById('confirmAlsoSaveProjectModal')) {
+    const overlay = document.createElement('div');
+    overlay.id = 'confirmAlsoSaveProjectModal';
+    overlay.className = 'hidden fixed inset-0 bg-black/50 z-[100] flex items-center justify-center px-4';
+    overlay.innerHTML = `
+      <div class="w-full max-w-md bg-white rounded-xl shadow-xl border border-slate-200 p-4">
+        <div class="font-bold text-slate-900 mb-2">프로젝트도 함께 저장할까요?</div>
+        <div class="text-sm text-slate-700 mb-4">PDF와 별도로 프로젝트(.pdfedit) 파일을 저장하면 원본 PDF와 편집 상태를 나중에 다시 불러올 수 있습니다.</div>
+        <div class="flex items-center justify-end gap-2">
+          <button id="btnPdfOnlyExport" class="px-3 py-2 rounded bg-slate-100 hover:bg-slate-200 text-slate-800">PDF만 저장</button>
+          <button id="btnPdfAndProjectExport" class="px-3 py-2 rounded bg-blue-600 hover:bg-blue-500 text-white">함께 저장</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+
+    overlay.querySelector('#btnPdfOnlyExport')?.addEventListener('click', () => {
+      if (confirmAlsoSaveProjectResolve) confirmAlsoSaveProjectResolve(false);
+      closeConfirmAlsoSaveProjectModal();
+    });
+    overlay.querySelector('#btnPdfAndProjectExport')?.addEventListener('click', () => {
+      if (confirmAlsoSaveProjectResolve) confirmAlsoSaveProjectResolve(true);
+      closeConfirmAlsoSaveProjectModal();
     });
   }
 })();
@@ -2424,6 +2471,22 @@ currentPageNum.addEventListener('input', schedulePageInputNavigation);
 
 document.addEventListener('keydown', (e) => {
   // Modal shortcut handling (Esc/Enter) - 입력창 포커스 여부와 무관하게 동작
+  if (isConfirmAlsoSaveProjectModalOpen) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      if (confirmAlsoSaveProjectResolve) confirmAlsoSaveProjectResolve(false);
+      closeConfirmAlsoSaveProjectModal();
+      return;
+    }
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (confirmAlsoSaveProjectResolve) confirmAlsoSaveProjectResolve(true);
+      closeConfirmAlsoSaveProjectModal();
+      return;
+    }
+    return;
+  }
+
   if (isConfirmAfterProjectExportModalOpen) {
     if (e.key === 'Escape') {
       e.preventDefault();
@@ -2801,7 +2864,7 @@ const EXPORT_RENDER_SCALE = 1.75;
 const EXPORT_JPEG_QUALITY = 0.95;
 // Export 시 메모리/성능 절충용 다운스케일 상한
 // - 값이 너무 낮으면 저장된 고해상도 이미지가 다시 줄어들어 품질이 손상됩니다.
-const EXPORT_MAX_CANVAS_DIMENSION = 2600;
+const EXPORT_MAX_CANVAS_DIMENSION = 3000;
 
 function getExportMaxCanvasDimension() {
   // crop/편집 저장 해상도보다 export 상한이 낮으면 품질이 저장 시점에 고정됩니다.
@@ -3267,12 +3330,20 @@ function loadImage(src) {
 btnExportPdf.addEventListener('click', async () => {
   if (pageList.length === 0) return;
 
+  const alsoSaveProject = await openConfirmAlsoSaveProjectModal();
+  if (alsoSaveProject && !pdfSourceData) {
+    showToast('원본 PDF 데이터가 없어 프로젝트는 저장하지 않습니다.', 'warning');
+  }
+
+  const shouldSaveProject = alsoSaveProject && !!pdfSourceData;
+
   const exportSessionId = `export-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   let exportSegmentCount = 0;
 
   try {
     const suggestedName = originalFileName || 'edited_document.pdf';
     let fileHandle: FileSystemFileHandle | null = null;
+    let projectFileHandle: FileSystemFileHandle | null = null;
 
     // File System Access API는 showSaveFilePicker 호출 시점에 사용자 제스처가 필요합니다.
     // 그래서 "PDF 바이트를 만드는 무거운 await" 전에 먼저 파일 핸들을 확보합니다.
@@ -3292,6 +3363,19 @@ btnExportPdf.addEventListener('click', async () => {
         }
         throw err;
       }
+
+      if (shouldSaveProject) {
+        try {
+          projectFileHandle = await pickProjectExportFileHandle();
+        } catch (err: any) {
+          if (err?.name === 'AbortError') {
+            showToast('프로젝트 저장 위치 선택이 취소되어 PDF만 저장합니다.', 'info');
+          } else {
+            throw err;
+          }
+        }
+      }
+
       // 저장 위치 선택이 끝난 뒤에만 PDF 생성 UI를 보여줍니다.
       showExportToast('PDF 생성 중...');
     } else {
@@ -3519,6 +3603,18 @@ btnExportPdf.addEventListener('click', async () => {
 
     hideExportToast();
     showToast('PDF가 성공적으로 다운로드되었습니다.', 'success');
+
+    if (shouldSaveProject) {
+      try {
+        showLoading('프로젝트 파일 생성 중...', '원본 PDF + 편집 상태를 묶고 있습니다.');
+        await exportProjectFile({ fileHandle: projectFileHandle });
+      } catch (projectErr) {
+        console.error('Project Export Error (after PDF):', projectErr);
+        showToast('PDF는 저장됐지만 프로젝트 저장에 실패했습니다.', 'error');
+      } finally {
+        hideLoading();
+      }
+    }
   } catch (err) {
     console.error('PDF Export Error:', err);
     hideExportToast();
@@ -3545,103 +3641,132 @@ async function gzipBlobIfPossible(blob) {
   }
 }
 
+function getProjectExportNameInfo() {
+  const suggestedNameBase = (originalFileName || sourceFileName || 'pdf_project')
+    .replace(/\.pdf$/i, '')
+    .replace(/[^\w.\-]+/g, '_');
+  const willTryGzip = typeof CompressionStream !== 'undefined';
+  const outNameForPicker = willTryGzip
+    ? `${suggestedNameBase}.pdfedit.gz`
+    : `${suggestedNameBase}.pdfedit`;
+
+  return { suggestedNameBase, outNameForPicker, willTryGzip };
+}
+
+async function createProjectExportBlob() {
+  if (pageList.length === 0 || !pdfSourceData) {
+    throw new Error('Project export data is unavailable.');
+  }
+
+  const project = {
+    version: 1,
+    createdAt: Date.now(),
+    sourceFileName,
+    originalFileName,
+    currentPageIndex,
+    pageList,
+  };
+
+  const jsonStr = JSON.stringify(project);
+  const jsonBytes = new TextEncoder().encode(jsonStr);
+  const magicBytes = new TextEncoder().encode('PDFPAGEEDIT\0');
+  const header = new Uint8Array(magicBytes.length + 4);
+  header.set(magicBytes, 0);
+  new DataView(header.buffer).setUint32(magicBytes.length, jsonBytes.length, true);
+
+  const rawBlob = new Blob([header, jsonBytes, pdfSourceData], { type: 'application/octet-stream' });
+  return gzipBlobIfPossible(rawBlob);
+}
+
+async function pickProjectExportFileHandle() {
+  if (!window.showSaveFilePicker) return null;
+
+  const { outNameForPicker } = getProjectExportNameInfo();
+  return window.showSaveFilePicker({
+    suggestedName: outNameForPicker,
+    types: [
+      {
+        description: 'PDF Edit Project',
+        accept: { 'application/octet-stream': ['.pdfedit', '.pdfedit.gz'] },
+      },
+    ],
+  });
+}
+
+async function writeProjectExportBlob(blobInfo, fileHandle = null) {
+  const { blob, used } = blobInfo;
+  const { suggestedNameBase, willTryGzip } = getProjectExportNameInfo();
+
+  if (fileHandle) {
+    const writable = await fileHandle.createWritable();
+    await writable.write(blob);
+    await writable.close();
+    return;
+  }
+
+  const outName = used || willTryGzip
+    ? `${suggestedNameBase}.pdfedit.gz`
+    : `${suggestedNameBase}.pdfedit`;
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = outName;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+async function exportProjectFile(options = {}) {
+  const { fileHandle: presetFileHandle = null } = options;
+
+  let fileHandle = presetFileHandle;
+  if (window.showSaveFilePicker && !fileHandle) {
+    showToast('저장을 위해 File System Access API를 사용합니다.', 'info');
+    try {
+      fileHandle = await pickProjectExportFileHandle();
+    } catch (err) {
+      if (err?.name === 'AbortError') {
+        showToast('프로젝트 저장이 취소되었습니다.', 'info');
+        return false;
+      }
+      throw err;
+    }
+  }
+
+  const blobInfo = await createProjectExportBlob();
+  await writeProjectExportBlob(blobInfo, fileHandle);
+  showToast('프로젝트 파일이 성공적으로 다운로드되었습니다.', 'success');
+  return true;
+}
+
 btnExportProject?.addEventListener('click', async () => {
   if (pageList.length === 0 || !pdfSourceData) return;
 
   showLoading('프로젝트 파일 생성 중...', '원본 PDF + 편집 상태를 묶고 있습니다.');
-  let loadingActive = true;
   try {
-    const suggestedNameBase = (originalFileName || sourceFileName || 'pdf_project')
-      .replace(/\.pdf$/i, '')
-      .replace(/[^\w.\-]+/g, '_');
-
-    const willTryGzip = typeof CompressionStream !== 'undefined';
-    const outNameForPicker = willTryGzip
-      ? `${suggestedNameBase}.pdfedit.gz`
-      : `${suggestedNameBase}.pdfedit`;
-
-    let fileHandle: FileSystemFileHandle | null = null;
-    if (window.showSaveFilePicker) {
-      showToast('저장을 위해 File System Access API를 사용합니다.', 'info');
-      try {
-        fileHandle = await window.showSaveFilePicker({
-          suggestedName: outNameForPicker,
-          types: [
-            {
-              description: 'PDF Edit Project',
-              accept: { 'application/octet-stream': ['.pdfedit', '.pdfedit.gz'] },
-            },
-          ],
-        });
-      } catch (err: any) {
-        if (err?.name === 'AbortError') {
-          showToast('프로젝트 저장이 취소되었습니다.', 'info');
-          return;
-        }
-        throw err;
-      }
-    }
-
-    const project = {
-      version: 1,
-      createdAt: Date.now(),
-      sourceFileName,
-      originalFileName,
-      currentPageIndex,
-      pageList,
-    };
-
-    const jsonStr = JSON.stringify(project);
-    const jsonBytes = new TextEncoder().encode(jsonStr);
-    const magicBytes = new TextEncoder().encode('PDFPAGEEDIT\0'); // 13 bytes
-
-    const header = new Uint8Array(magicBytes.length + 4);
-    header.set(magicBytes, 0);
-    new DataView(header.buffer).setUint32(magicBytes.length, jsonBytes.length, true);
-
-    const rawBlob = new Blob([header, jsonBytes, pdfSourceData], { type: 'application/octet-stream' });
-
-    const { blob: outBlob, used: usedGzip } = await gzipBlobIfPossible(rawBlob);
-
-    if (fileHandle) {
-      const writable = await fileHandle.createWritable();
-      await writable.write(outBlob);
-      await writable.close();
-    } else {
-      const outName = usedGzip ? `${suggestedNameBase}.pdfedit.gz` : `${suggestedNameBase}.pdfedit`;
-      const url = URL.createObjectURL(outBlob);
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = outName;
-      link.click();
-      setTimeout(() => URL.revokeObjectURL(url), 0);
-    }
-
-    showToast('프로젝트 파일이 성공적으로 다운로드되었습니다.', 'success');
-
-    // 다운로드가 끝났으므로 로딩 오버레이를 먼저 닫고, 정리 여부를 확인합니다.
-    loadingActive = false;
-    hideLoading();
-    closeShortcutsModal();
-    closeConfirmCropExitModal();
-    closeConfirmDeleteProjectModal();
-
-    const shouldCleanupAndClose = await openConfirmAfterProjectExportModal();
-    if (shouldCleanupAndClose) {
-      showLoading('정리 중...', 'IndexedDB 캐시를 삭제하고 프로젝트를 닫습니다.');
-      try {
-        await clearEditorSession();
-        resetEditorToNoProject();
-        showToast('IndexedDB가 삭제되었고 프로젝트가 닫혔습니다.', 'info');
-      } finally {
-        hideLoading();
-      }
-    }
+    const saved = await exportProjectFile();
+    if (!saved) return;
   } catch (err) {
     console.error('Project Export Error:', err);
     showToast('프로젝트 파일 생성에 실패했습니다.', 'error');
+    return;
   } finally {
-    if (loadingActive) hideLoading();
+    hideLoading();
+  }
+
+  closeShortcutsModal();
+  closeConfirmCropExitModal();
+  closeConfirmDeleteProjectModal();
+
+  const shouldCleanupAndClose = await openConfirmAfterProjectExportModal();
+  if (shouldCleanupAndClose) {
+    showLoading('정리 중...', 'IndexedDB 캐시를 삭제하고 프로젝트를 닫습니다.');
+    try {
+      await clearEditorSession();
+      resetEditorToNoProject();
+      showToast('IndexedDB가 삭제되었고 프로젝트가 닫혔습니다.', 'info');
+    } finally {
+      hideLoading();
+    }
   }
 });
 
