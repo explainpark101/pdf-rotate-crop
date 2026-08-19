@@ -1,9 +1,10 @@
 // @ts-nocheck
 
 const DB_NAME = 'pdf-page-editor';
-const DB_VERSION = 3;
+const DB_VERSION = 4;
 const STORE_NAME = 'sessions';
 const PAGE_ASSETS_STORE = 'pageAssets';
+const PAGE_HISTORY_STORE = 'pageHistory';
 
 export const EDITOR_PDF_KEY = 'pdf';
 export const EDITOR_STATE_KEY = 'state';
@@ -25,6 +26,10 @@ function openDb() {
       } else if (oldVersion > 0 && oldVersion < 3) {
         db.deleteObjectStore(PAGE_ASSETS_STORE);
         db.createObjectStore(PAGE_ASSETS_STORE, { keyPath: 'id' });
+      }
+
+      if (!db.objectStoreNames.contains(PAGE_HISTORY_STORE)) {
+        db.createObjectStore(PAGE_HISTORY_STORE, { keyPath: 'pageId' });
       }
     };
 
@@ -204,12 +209,71 @@ export function clearPageAssets() {
   });
 }
 
+export function savePageHistoryEvent(pageId, event) {
+  const MAX_EVENTS = 20;
+
+  return runWriteTransaction([PAGE_HISTORY_STORE], ([store]) => {
+    return new Promise((resolve, reject) => {
+      const getReq = store.get(pageId);
+      getReq.onsuccess = () => {
+        const existing = getReq.result;
+        const events = Array.isArray(existing?.events) ? existing.events : [];
+        events.push(event);
+        if (events.length > MAX_EVENTS) {
+          events.splice(0, events.length - MAX_EVENTS);
+        }
+
+        const next = {
+          pageId,
+          updatedAt: Date.now(),
+          events,
+        };
+
+        const putReq = store.put(next);
+        putReq.onsuccess = () => resolve();
+        putReq.onerror = () => reject(putReq.error);
+      };
+      getReq.onerror = () => reject(getReq.error);
+    });
+  });
+}
+
+export function loadPageHistories() {
+  return runReadTransaction([PAGE_HISTORY_STORE], ([store]) => {
+    return new Promise((resolve, reject) => {
+      const request = store.getAll();
+      request.onsuccess = () => {
+        const map = new Map();
+        for (const record of request.result ?? []) {
+          if (!record?.pageId) continue;
+          map.set(record.pageId, Array.isArray(record.events) ? record.events : []);
+        }
+        resolve(map);
+      };
+      request.onerror = () => reject(request.error);
+    });
+  });
+}
+
+export function deletePageHistory(pageId) {
+  return runWriteTransaction([PAGE_HISTORY_STORE], ([store]) => {
+    store.delete(pageId);
+  });
+}
+
+export function clearPageHistories() {
+  return runWriteTransaction([PAGE_HISTORY_STORE], ([store]) => {
+    store.clear();
+  });
+}
+
 export async function loadEditorSession() {
-  const [pdfRecord, stateRecord, legacyRecord, pageAssets] = await Promise.all([
+  const [pdfRecord, stateRecord, legacyRecord, pageAssets, pageHistories] = await Promise.all([
     getRecord(EDITOR_PDF_KEY),
     getRecord(EDITOR_STATE_KEY),
     getRecord('current'),
     loadPageAssets(),
+    loadPageHistories(),
   ]);
 
   if (pdfRecord?.pdfData && stateRecord?.pageList?.length) {
@@ -221,6 +285,7 @@ export async function loadEditorSession() {
       currentPageIndex: stateRecord.currentPageIndex ?? 0,
       savedAt: stateRecord.savedAt ?? 0,
       pageAssets,
+      pageHistories,
     };
   }
 
@@ -233,6 +298,7 @@ export async function loadEditorSession() {
       currentPageIndex: legacyRecord.currentPageIndex ?? 0,
       savedAt: legacyRecord.savedAt ?? 0,
       pageAssets: hydrateLegacyPageAssets(legacyRecord.pageList, pageAssets),
+      pageHistories,
     };
   }
 
@@ -257,5 +323,6 @@ export async function clearEditorSession() {
     deleteRecord(EDITOR_STATE_KEY),
     deleteRecord('current'),
     clearPageAssets(),
+    clearPageHistories(),
   ]);
 }

@@ -4,9 +4,11 @@ import { PDFDocument } from 'pdf-lib';
 import {
   clearEditorSession,
   loadEditorSession,
+  deletePageHistory,
   saveEditorPdfRecord,
   saveEditorStateRecord,
   savePageAssetsIncremental,
+  savePageHistoryEvent,
 } from '@/editor-session-store.ts';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url).toString();
@@ -259,6 +261,28 @@ function hydratePageListFromSession(pages, pageAssets = new Map()) {
   });
 }
 
+function applyPageHistoriesToPageList(pages, pageHistories = new Map()) {
+  if (!pages?.length) return;
+  if (!pageHistories) return;
+
+  for (const page of pages) {
+    const events = pageHistories.get(page.id);
+    if (!Array.isArray(events) || events.length === 0) continue;
+
+    // 이벤트가 있다는 것은 "이 시점의 결과 스냅샷"을 복원할 수 있다는 뜻이므로,
+    // 이벤트 순서대로 snapshot을 재적용합니다.
+    for (const event of events) {
+      const snap = event?.snapshot;
+      if (!snap) continue;
+
+      if ('originalPageIndex' in snap) page.originalPageIndex = snap.originalPageIndex ?? null;
+      if ('rotation' in snap) page.rotation = typeof snap.rotation === 'number' ? snap.rotation : page.rotation;
+      if ('crop' in snap) page.crop = snap.crop ?? null;
+      if ('customImageDataUrl' in snap) page.customImageDataUrl = snap.customImageDataUrl ?? null;
+    }
+  }
+}
+
 function getPageIndexCacheKey(fileName = sourceFileName) {
   return `${PAGE_INDEX_CACHE_PREFIX}${fileName || 'unknown'}`;
 }
@@ -452,6 +476,8 @@ async function restoreEditorSession() {
       session.pageList,
       session.pageAssets ?? new Map()
     );
+
+    applyPageHistoriesToPageList(hydratedPageList, session.pageHistories ?? new Map());
     const restoredPageIndex = resolveRestoredPageIndex(
       session.currentPageIndex,
       session.sourceFileName,
@@ -1123,6 +1149,17 @@ btnAddCroppedPage.addEventListener('click', async () => {
     pageList.splice(currentPageIndex + 1, 0, newPageItem);
     currentPageIndex++;
 
+    await savePageHistoryEvent(newPageItem.id, {
+      type: 'crop_add',
+      ts: Date.now(),
+      snapshot: {
+        originalPageIndex: null,
+        rotation: 0,
+        crop: null,
+        customImageDataUrl: croppedDataUrl,
+      },
+    });
+
     btnToggleCrop.click();
 
     await renderSidebarThumbnails();
@@ -1144,6 +1181,7 @@ btnApplyCropToPage.addEventListener('click', async () => {
   try {
     const croppedDataUrl = await generateCroppedImageDataUrl();
     const currentItem = pageList[currentPageIndex];
+    const pageId = currentItem.id;
 
     pageList[currentPageIndex] = {
       ...currentItem,
@@ -1152,6 +1190,17 @@ btnApplyCropToPage.addEventListener('click', async () => {
       crop: null,
       customImageDataUrl: croppedDataUrl
     };
+
+    await savePageHistoryEvent(pageId, {
+      type: 'crop_apply',
+      ts: Date.now(),
+      snapshot: {
+        originalPageIndex: null,
+        rotation: 0,
+        crop: null,
+        customImageDataUrl: croppedDataUrl,
+      },
+    });
 
     btnToggleCrop.click();
 
@@ -1171,6 +1220,7 @@ async function applyRotationToCurrentPage() {
   if (currentPageIndex < 0 || currentPageIndex >= pageList.length) return;
 
   const item = pageList[currentPageIndex];
+  const pageId = item.id;
   if (isRotationZero(item.rotation)) return;
 
   showLoading('회전 적용 중...', '현재 페이지에 회전을 반영하고 있습니다.');
@@ -1185,6 +1235,17 @@ async function applyRotationToCurrentPage() {
       crop: null,
       customImageDataUrl: dataUrl
     };
+
+    await savePageHistoryEvent(pageId, {
+      type: 'rotate_apply',
+      ts: Date.now(),
+      snapshot: {
+        originalPageIndex: null,
+        rotation: 0,
+        crop: null,
+        customImageDataUrl: dataUrl,
+      },
+    });
 
     await renderSidebarThumbnails();
     await renderCurrentPage();
@@ -1238,6 +1299,7 @@ function deletePage(index) {
     return;
   }
 
+  const removedPageId = pageList[index]?.id;
   pageList.splice(index, 1);
   if (currentPageIndex >= pageList.length) {
     currentPageIndex = pageList.length - 1;
@@ -1247,6 +1309,10 @@ function deletePage(index) {
   renderCurrentPage();
   notifyPageIndexChanged();
   showToast('Page deleted.', 'info');
+
+  if (removedPageId) {
+    void deletePageHistory(removedPageId).catch(() => {});
+  }
 }
 
 function movePage(fromIndex, toIndex) {
@@ -1439,6 +1505,30 @@ async function renderFullPageToCanvas(item) {
   return renderPageToCanvas(item, 2.0);
 }
 
+// Export용: 출력 PDF 크기를 줄이기 위한 다운스케일/압축 설정
+const EXPORT_RENDER_SCALE = 1.35;
+const EXPORT_JPEG_QUALITY = 0.78;
+const EXPORT_MAX_CANVAS_DIMENSION = 1800;
+
+function downscaleCanvasToMaxDimension(canvas, maxDimension) {
+  if (!canvas) return canvas;
+  if (canvas.width <= maxDimension && canvas.height <= maxDimension) return canvas;
+
+  const scale = Math.min(maxDimension / canvas.width, maxDimension / canvas.height);
+  const newW = Math.max(1, Math.round(canvas.width * scale));
+  const newH = Math.max(1, Math.round(canvas.height * scale));
+
+  const scaled = document.createElement('canvas');
+  scaled.width = newW;
+  scaled.height = newH;
+  scaled.getContext('2d').drawImage(canvas, 0, 0, newW, newH);
+  return scaled;
+}
+
+async function renderFullPageToCanvasForExport(item) {
+  return renderPageToCanvas(item, EXPORT_RENDER_SCALE);
+}
+
 function loadImage(src) {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -1459,8 +1549,12 @@ btnExportPdf.addEventListener('click', async () => {
       const item = pageList[i];
       updateExportToast(`페이지 처리 중 (${i + 1}/${pageList.length})...`);
 
-      const canvas = await renderFullPageToCanvas(item);
-      const dataUrl = canvas.toDataURL('image/jpeg', 0.92);
+      const canvas = await renderFullPageToCanvasForExport(item);
+      const compressedCanvas = downscaleCanvasToMaxDimension(
+        canvas,
+        EXPORT_MAX_CANVAS_DIMENSION
+      );
+      const dataUrl = compressedCanvas.toDataURL('image/jpeg', EXPORT_JPEG_QUALITY);
 
       const jpgImage = await pdfDocOutput.embedJpg(dataUrl);
       const page = pdfDocOutput.addPage([jpgImage.width, jpgImage.height]);
@@ -1475,7 +1569,7 @@ btnExportPdf.addEventListener('click', async () => {
 
     updateExportToast('PDF 저장 중...');
 
-    const pdfBytes = await pdfDocOutput.save();
+    const pdfBytes = await pdfDocOutput.save({ useObjectStreams: true });
 
     const blob = new Blob([pdfBytes], { type: 'application/pdf' });
     const link = document.createElement('a');
