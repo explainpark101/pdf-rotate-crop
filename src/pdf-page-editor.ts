@@ -2095,32 +2095,35 @@ async function applyRotationToCurrentPage() {
 
 async function generateCroppedImageDataUrl() {
   const item = pageList[currentPageIndex];
-  let srcCanvas = pdfCanvas;
+  // crop 결과 품질을 위해, 화면용 pdfCanvas 대신 저장용 렌더 스케일로 다시 렌더링합니다.
+  const srcCanvas = await renderPageToCanvas(item, PAGE_IMAGE_STORAGE_RENDER_SCALE);
+  try {
+    const srcW = srcCanvas.width;
+    const srcH = srcCanvas.height;
 
-  if (item.rotation !== 0) {
-    srcCanvas = await renderPageToCanvas(item, PAGE_IMAGE_STORAGE_RENDER_SCALE);
+    const cropX = cropBox.x * srcW;
+    const cropY = cropBox.y * srcH;
+    const cropW = cropBox.w * srcW;
+    const cropH = cropBox.h * srcH;
+
+    const offCanvas = document.createElement('canvas');
+    offCanvas.width = cropW;
+    offCanvas.height = cropH;
+
+    const ctx = offCanvas.getContext('2d');
+    ctx.drawImage(
+      srcCanvas,
+      cropX, cropY, cropW, cropH,
+      0, 0, cropW, cropH
+    );
+
+    return canvasToStorageDataUrl(offCanvas);
+  } finally {
+    try {
+      srcCanvas.width = 0;
+      srcCanvas.height = 0;
+    } catch (_e) {}
   }
-
-  const srcW = srcCanvas.width;
-  const srcH = srcCanvas.height;
-
-  const cropX = cropBox.x * srcW;
-  const cropY = cropBox.y * srcH;
-  const cropW = cropBox.w * srcW;
-  const cropH = cropBox.h * srcH;
-
-  const offCanvas = document.createElement('canvas');
-  offCanvas.width = cropW;
-  offCanvas.height = cropH;
-
-  const ctx = offCanvas.getContext('2d');
-  ctx.drawImage(
-    srcCanvas,
-    cropX, cropY, cropW, cropH,
-    0, 0, cropW, cropH
-  );
-
-  return canvasToStorageDataUrl(offCanvas);
 }
 
 btnDeleteCurrentPage.addEventListener('click', () => {
