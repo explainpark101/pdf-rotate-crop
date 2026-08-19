@@ -13,6 +13,7 @@ import {
   setPageHistoryBaseline,
   setPageHistoryPointer,
 } from '@/editor-session-store.ts';
+import { gunzipSync } from 'fflate';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url).toString();
 
@@ -78,6 +79,7 @@ const PAGE_IMAGE_STORAGE_RENDER_SCALE = 1.25;
 
 /* DOM Elements */
 const pdfFileInput = document.getElementById('pdfFileInput');
+const pdfProjectFileInput = document.getElementById('pdfProjectFileInput');
 const dropzone = document.getElementById('dropzone');
 const canvasWrapper = document.getElementById('canvasWrapper');
 const pdfCanvas = document.getElementById('pdfCanvas');
@@ -351,6 +353,13 @@ pdfFileInput.addEventListener('change', (e) => {
   }
 });
 
+pdfProjectFileInput?.addEventListener('change', (e) => {
+  if (e.target.files && e.target.files[0]) {
+    const file = e.target.files[0];
+    void loadProjectFile(file);
+  }
+});
+
 async function loadPdfFile(file) {
   showLoading('PDF 파일을 읽는 중...', '기존 IndexedDB를 초기화하고 저장합니다.');
   try {
@@ -376,12 +385,21 @@ function decodeProjectMagicBytes() {
 
 async function ungzipIfNeeded(arrayBuffer, shouldGunzip) {
   if (!shouldGunzip) return new Uint8Array(arrayBuffer);
-  if (typeof DecompressionStream === 'undefined') {
-    throw new Error('DecompressionStream is not supported in this browser.');
+  const input = new Uint8Array(arrayBuffer);
+
+  // Prefer native DecompressionStream when available (faster, streaming).
+  if (typeof DecompressionStream !== 'undefined') {
+    const stream = new Blob([input]).stream().pipeThrough(new DecompressionStream('gzip'));
+    const out = await new Response(stream).arrayBuffer();
+    return new Uint8Array(out);
   }
-  const stream = new Blob([arrayBuffer]).stream().pipeThrough(new DecompressionStream('gzip'));
-  const out = await new Response(stream).arrayBuffer();
-  return new Uint8Array(out);
+
+  // Fallback for browsers/environments without DecompressionStream (e.g. Safari variants).
+  try {
+    return gunzipSync(input);
+  } catch (_e) {
+    throw new Error('Failed to unzip .pdfedit.gz (unsupported environment or invalid gzip).');
+  }
 }
 
 async function loadProjectFile(file) {
