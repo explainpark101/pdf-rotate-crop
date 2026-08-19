@@ -2697,6 +2697,101 @@ async function renderPageToCanvas(item, scale = 2.0, reuseCanvas = null) {
   return offCanvas;
 }
 
+function cancelActivePageRender() {
+  if (!currentRenderTask) return;
+  try {
+    currentRenderTask.cancel();
+  } catch (_e) {}
+  currentRenderTask = null;
+}
+
+async function renderExportPageToCanvas(item, scale, targetCanvas, scratchCanvas, scratchCtx, maxSourceDimension) {
+  const deg = normalizeRotation(item.rotation);
+  const rad = (deg * Math.PI) / 180;
+  const ctx = targetCanvas.getContext('2d');
+  if (!ctx) throw new Error('Failed to get 2D context from export canvas.');
+
+  let srcW = 0;
+  let srcH = 0;
+  let pdfPage = null;
+
+  try {
+    if (item.customImageDataUrl) {
+      const img = await loadImage(item.customImageDataUrl);
+      const { w, h } = getScaledSize(img.width, img.height, maxSourceDimension);
+      targetCanvas.width = w;
+      targetCanvas.height = h;
+      ctx.clearRect(0, 0, w, h);
+      ctx.drawImage(img, 0, 0, w, h);
+      srcW = w;
+      srcH = h;
+    } else {
+      pdfPage = await pdfDoc.getPage(item.originalPageIndex);
+      const baseViewport = pdfPage.getViewport({ scale: 1 });
+      const fitScale = Math.min(
+        scale,
+        maxSourceDimension / baseViewport.width,
+        maxSourceDimension / baseViewport.height
+      );
+      const viewport = pdfPage.getViewport({ scale: Math.max(fitScale, 0.1) });
+
+      targetCanvas.width = viewport.width;
+      targetCanvas.height = viewport.height;
+      ctx.clearRect(0, 0, viewport.width, viewport.height);
+
+      let renderTask = null;
+      try {
+        renderTask = pdfPage.render({ canvasContext: ctx, viewport });
+        await renderTask.promise;
+      } catch (err) {
+        if (renderTask && typeof renderTask.cancel === 'function') {
+          try {
+            renderTask.cancel();
+          } catch (_e) {}
+        }
+        throw err;
+      }
+
+      srcW = viewport.width;
+      srcH = viewport.height;
+    }
+
+    if (deg === 0) return targetCanvas;
+
+    scratchCanvas.width = srcW;
+    scratchCanvas.height = srcH;
+    scratchCtx.clearRect(0, 0, srcW, srcH);
+    scratchCtx.drawImage(targetCanvas, 0, 0);
+
+    const sin = Math.abs(Math.sin(rad));
+    const cos = Math.abs(Math.cos(rad));
+    const newW = Math.round(srcW * cos + srcH * sin);
+    const newH = Math.round(srcW * sin + srcH * cos);
+
+    targetCanvas.width = newW;
+    targetCanvas.height = newH;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, newW, newH);
+    ctx.translate(newW / 2, newH / 2);
+    ctx.rotate(rad);
+    ctx.drawImage(scratchCanvas, -srcW / 2, -srcH / 2);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+
+    scratchCanvas.width = 0;
+    scratchCanvas.height = 0;
+
+    return targetCanvas;
+  } finally {
+    if (pdfPage && typeof pdfPage.cleanup === 'function') {
+      try {
+        pdfPage.cleanup();
+      } catch (_e) {}
+    }
+    pageCache.delete(item.originalPageIndex);
+  }
+}
+
 async function renderFullPageToCanvas(item) {
   return renderPageToCanvas(item, 2.0);
 }
@@ -2704,7 +2799,7 @@ async function renderFullPageToCanvas(item) {
 // Export용: 출력 PDF 크기를 줄이기 위한 다운스케일/압축 설정
 const EXPORT_RENDER_SCALE = 1.75;
 // 요청사항: JPEG 품질 1
-const EXPORT_JPEG_QUALITY = 1;
+const EXPORT_JPEG_QUALITY = .9;
 // Export 시 메모리/성능 절충용 다운스케일 상한
 // - 값이 너무 낮으면 저장된 고해상도 이미지가 다시 줄어들어 품질이 손상됩니다.
 const EXPORT_MAX_CANVAS_DIMENSION = 2400;
@@ -2732,15 +2827,66 @@ function resizeAndDrawToReusableCanvas(sourceCanvas, targetCanvas, targetCtx, ma
 
 function canvasToJpegBlob(canvas, quality, mime = 'image/jpeg') {
   return new Promise((resolve, reject) => {
+    if (!canvas || canvas.width <= 0 || canvas.height <= 0) {
+      reject(new Error(`Invalid canvas for JPEG encode: ${canvas?.width}x${canvas?.height}`));
+      return;
+    }
+
     canvas.toBlob(
       (blob) => {
-        if (!blob) return reject(new Error('Failed to create JPEG blob.'));
+        if (!blob) {
+          reject(new Error(`Failed to create JPEG blob (${canvas.width}x${canvas.height}).`));
+          return;
+        }
         resolve(blob);
       },
       mime,
       quality
     );
   });
+}
+
+async function canvasToJpegBlobFromCanvas(sourceCanvas, quality, encodeCanvas, encodeCtx) {
+  try {
+    return await canvasToJpegBlob(sourceCanvas, quality, 'image/jpeg');
+  } catch (directErr) {
+    console.warn('[Export]', 'direct toBlob failed', directErr);
+  }
+
+  encodeCanvas.width = sourceCanvas.width;
+  encodeCanvas.height = sourceCanvas.height;
+  encodeCtx.clearRect(0, 0, encodeCanvas.width, encodeCanvas.height);
+  encodeCtx.drawImage(sourceCanvas, 0, 0);
+
+  try {
+    const blob = await canvasToJpegBlob(encodeCanvas, quality, 'image/jpeg');
+    return blob;
+  } catch (copyErr) {
+    console.warn('[Export]', 'encode canvas toBlob failed', copyErr);
+  } finally {
+    try {
+      encodeCanvas.width = 0;
+      encodeCanvas.height = 0;
+    } catch (_e) {}
+  }
+
+  let dataUrl = '';
+  try {
+    dataUrl = sourceCanvas.toDataURL('image/jpeg', quality);
+  } catch (dataUrlErr) {
+    throw dataUrlErr;
+  }
+
+  if (!dataUrl.startsWith('data:image/')) {
+    throw new Error('toDataURL produced invalid JPEG data.');
+  }
+
+  const response = await fetch(dataUrl);
+  const blob = await response.blob();
+  if (!blob || blob.size === 0) {
+    throw new Error('Failed to convert JPEG data URL to blob.');
+  }
+  return blob;
 }
 
 async function downscaleCanvasInPlace(canvas, maxDimension) {
@@ -2776,6 +2922,296 @@ async function downscaleCanvasInPlace(canvas, maxDimension) {
   }
 }
 
+// Export 전용: ImageBitmap/toDataURL 없이 scratch canvas로 다운스케일(메모리 피크 방지)
+function downscaleCanvasForExport(sourceCanvas, maxDimension, scratchCanvas, scratchCtx) {
+  if (!sourceCanvas) return;
+  if (sourceCanvas.width <= maxDimension && sourceCanvas.height <= maxDimension) return;
+
+  const { w, h } = getScaledSize(sourceCanvas.width, sourceCanvas.height, maxDimension);
+  scratchCanvas.width = w;
+  scratchCanvas.height = h;
+  scratchCtx.clearRect(0, 0, w, h);
+  scratchCtx.drawImage(sourceCanvas, 0, 0, w, h);
+
+  sourceCanvas.width = w;
+  sourceCanvas.height = h;
+  const ctx = sourceCanvas.getContext('2d');
+  ctx.clearRect(0, 0, w, h);
+  ctx.drawImage(scratchCanvas, 0, 0);
+
+  scratchCanvas.width = 0;
+  scratchCanvas.height = 0;
+}
+
+async function compactExportPdfDoc(doc, label) {
+  logExportMemory(`checkpoint start ${label}`);
+  const checkpointBytes = await doc.save({ useObjectStreams: true });
+  if (typeof doc.cleanup === 'function') {
+    try {
+      await doc.cleanup();
+    } catch (_e) {}
+  }
+  const reloadedDoc = await PDFDocument.load(checkpointBytes);
+  await new Promise((r) => setTimeout(r, 200));
+  pageCache.clear();
+  thumbnailCache.clear();
+  logExportMemory(`checkpoint done ${label}`);
+  console.debug('[Export]', `checkpoint done ${label}`, `bytes=${checkpointBytes.length}`);
+  return reloadedDoc;
+}
+
+function logExportMemory(label) {
+  const perf = performance;
+  if (!perf || !('memory' in perf) || !perf.memory) return;
+
+  const memory = perf.memory;
+  console.debug('[Export]', label, {
+    usedMB: Math.round(memory.usedJSHeapSize / 1048576),
+    totalMB: Math.round(memory.totalJSHeapSize / 1048576),
+    limitMB: Math.round(memory.jsHeapSizeLimit / 1048576),
+  });
+}
+
+async function encodeExportPageImage(canvas, quality, scratchCanvas, scratchCtx, encodeCanvas, encodeCtx) {
+  const attempts = [
+    { quality, maxDimension: null },
+    { quality: Math.max(0.48, quality - 0.1), maxDimension: 640 },
+    { quality: 0.4, maxDimension: 512 },
+  ];
+
+  let lastError = null;
+  for (const attempt of attempts) {
+    try {
+      if (attempt.maxDimension) {
+        downscaleCanvasForExport(canvas, attempt.maxDimension, scratchCanvas, scratchCtx);
+      }
+
+      console.debug('[Export]', 'encode attempt', {
+        quality: attempt.quality,
+        maxDimension: attempt.maxDimension,
+        size: `${canvas.width}x${canvas.height}`,
+      });
+      logExportMemory('before blob');
+
+      await new Promise((r) => setTimeout(r, 0));
+
+      const blob = await canvasToJpegBlobFromCanvas(
+        canvas,
+        attempt.quality,
+        encodeCanvas,
+        encodeCtx
+      );
+      console.debug('[Export]', 'blob created', `size=${blob.size}`);
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      console.debug('[Export]', 'bytes created', `len=${bytes.length}`);
+      logExportMemory('after bytes');
+      return bytes;
+    } catch (err) {
+      lastError = err;
+      console.warn('[Export]', 'encode attempt failed', attempt, err);
+    }
+  }
+
+  throw lastError || new Error('Failed to encode export page image.');
+}
+
+const EXPORT_SEG_DB_NAME = 'pdf-page-editor-export';
+const EXPORT_SEG_STORE = 'segments';
+
+function openExportSegDb() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(EXPORT_SEG_DB_NAME, 1);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(EXPORT_SEG_STORE)) {
+        db.createObjectStore(EXPORT_SEG_STORE, { keyPath: 'id' });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+function makeExportSegId(sessionId, index) {
+  return `${sessionId}:${index}`;
+}
+
+async function saveExportSegmentBytes(sessionId, index, bytes) {
+  const db = await openExportSegDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(EXPORT_SEG_STORE, 'readwrite');
+    tx.objectStore(EXPORT_SEG_STORE).put({
+      id: makeExportSegId(sessionId, index),
+      bytes,
+    });
+    tx.oncomplete = () => {
+      db.close();
+      resolve(undefined);
+    };
+    tx.onerror = () => {
+      db.close();
+      reject(tx.error);
+    };
+  });
+}
+
+async function loadExportSegmentBytes(sessionId, index) {
+  const db = await openExportSegDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(EXPORT_SEG_STORE, 'readonly');
+    const req = tx.objectStore(EXPORT_SEG_STORE).get(makeExportSegId(sessionId, index));
+    req.onsuccess = () => {
+      db.close();
+      resolve(req.result?.bytes || null);
+    };
+    req.onerror = () => {
+      db.close();
+      reject(req.error);
+    };
+  });
+}
+
+async function deleteExportSegmentBytes(sessionId, index) {
+  const db = await openExportSegDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(EXPORT_SEG_STORE, 'readwrite');
+    tx.objectStore(EXPORT_SEG_STORE).delete(makeExportSegId(sessionId, index));
+    tx.oncomplete = () => {
+      db.close();
+      resolve(undefined);
+    };
+    tx.onerror = () => {
+      db.close();
+      reject(tx.error);
+    };
+  });
+}
+
+async function clearExportSegments(sessionId, segmentCount) {
+  for (let i = 0; i < segmentCount; i++) {
+    try {
+      await deleteExportSegmentBytes(sessionId, i);
+    } catch (_e) {}
+  }
+}
+
+async function mergeExportSegments(sessionId, segmentCount, pageCount) {
+  let finalDoc = null;
+
+  for (let segIdx = 0; segIdx < segmentCount; segIdx++) {
+    updateExportToast(`PDF 병합 중 (세그먼트 ${segIdx + 1}/${segmentCount})...`);
+    const segBytes = await loadExportSegmentBytes(sessionId, segIdx);
+    if (!segBytes) {
+      throw new Error(`Export segment missing: ${segIdx}`);
+    }
+
+    console.debug('[Export]', `merge segment ${segIdx + 1}/${segmentCount}`, `bytes=${segBytes.length}`);
+    logExportMemory(`merge segment ${segIdx + 1}`);
+
+    if (!finalDoc) {
+      finalDoc = await PDFDocument.load(segBytes);
+    } else {
+      const segDoc = await PDFDocument.load(segBytes);
+      const indices = segDoc.getPageIndices();
+      const copiedPages = await finalDoc.copyPages(segDoc, indices);
+      copiedPages.forEach((p) => finalDoc.addPage(p));
+      if (typeof segDoc.cleanup === 'function') {
+        try {
+          await segDoc.cleanup();
+        } catch (_e) {}
+      }
+    }
+
+    await deleteExportSegmentBytes(sessionId, segIdx);
+
+    const mergeCheckpointEvery = pageCount >= 500 ? 2 : 4;
+    if (
+      finalDoc &&
+      (segIdx + 1) % mergeCheckpointEvery === 0 &&
+      segIdx + 1 < segmentCount
+    ) {
+      finalDoc = await compactExportPdfDoc(finalDoc, `merge-${segIdx + 1}/${segmentCount}`);
+    }
+
+    pageCache.clear();
+    thumbnailCache.clear();
+    await new Promise((r) => setTimeout(r, 150));
+  }
+
+  if (!finalDoc) {
+    throw new Error('Failed to merge export segments.');
+  }
+
+  return finalDoc;
+}
+
+async function appendExportPageToDoc({
+  doc,
+  item,
+  pageIndex,
+  pageCount,
+  workCanvas,
+  scratchCanvas,
+  scratchCtx,
+  encodeCanvas,
+  encodeCtx,
+  exportRenderScale,
+  exportMaxCanvasDimension,
+  exportEncodeMaxDimension,
+  exportJpegQuality,
+  useWebp,
+}) {
+  cancelActivePageRender();
+  pageCache.clear();
+  thumbnailCache.clear();
+  await new Promise((r) => setTimeout(r, 0));
+
+  console.debug('[Export]', `render start (${pageIndex + 1}/${pageCount})`);
+  await renderExportPageToCanvas(
+    item,
+    exportRenderScale,
+    workCanvas,
+    scratchCanvas,
+    scratchCtx,
+    exportMaxCanvasDimension
+  );
+  console.debug('[Export]', `render done (${pageIndex + 1}/${pageCount})`, `${workCanvas.width}x${workCanvas.height}`);
+
+  downscaleCanvasForExport(workCanvas, exportMaxCanvasDimension, scratchCanvas, scratchCtx);
+  downscaleCanvasForExport(workCanvas, exportEncodeMaxDimension, scratchCanvas, scratchCtx);
+  console.debug('[Export]', `downscale done (${pageIndex + 1}/${pageCount})`, `${workCanvas.width}x${workCanvas.height}`);
+
+  pageCache.clear();
+  if (pageCount >= 400) {
+    thumbnailCache.clear();
+  }
+
+  const imageBytes = await encodeExportPageImage(
+    workCanvas,
+    exportJpegQuality,
+    scratchCanvas,
+    scratchCtx,
+    encodeCanvas,
+    encodeCtx
+  );
+  const imgObj = useWebp ? await doc.embedWebp(imageBytes) : await doc.embedJpg(imageBytes);
+  console.debug('[Export]', `embed done (${pageIndex + 1}/${pageCount})`);
+
+  const page = doc.addPage([imgObj.width, imgObj.height]);
+  page.drawImage(imgObj, {
+    x: 0,
+    y: 0,
+    width: imgObj.width,
+    height: imgObj.height,
+  });
+  console.debug('[Export]', `page added (${pageIndex + 1}/${pageCount})`, `pages=${doc.getPageCount()}`);
+
+  if ((pageIndex + 1) % 25 === 0) {
+    await new Promise((r) => setTimeout(r, 100));
+    logExportMemory(`page pause ${pageIndex + 1}`);
+  }
+}
+
 async function renderFullPageToCanvasForExport(item) {
   return renderPageToCanvas(item, EXPORT_RENDER_SCALE);
 }
@@ -2791,6 +3227,9 @@ function loadImage(src) {
 
 btnExportPdf.addEventListener('click', async () => {
   if (pageList.length === 0) return;
+
+  const exportSessionId = `export-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  let exportSegmentCount = 0;
 
   try {
     const suggestedName = originalFileName || 'edited_document.pdf';
@@ -2821,89 +3260,216 @@ btnExportPdf.addEventListener('click', async () => {
       showExportToast('PDF 생성 중...');
     }
 
-    // OOM 방지: 모든 페이지를 한 PDF에 누적 임베딩하지 않고,
-    // chunk 단위로 임베딩+저장한 뒤 마지막에 합치는 방식으로 메모리를 낮춥니다.
     const workCanvas = document.createElement('canvas');
     const workCtx = workCanvas.getContext('2d');
     if (!workCtx) throw new Error('Failed to create canvas context for export.');
 
-    const PAGE_CHUNK_SIZE = 50;
-    const chunkPdfBytesList = [];
+    const scratchCanvas = document.createElement('canvas');
+    const scratchCtx = scratchCanvas.getContext('2d');
+    if (!scratchCtx) throw new Error('Failed to create scratch canvas context for export.');
 
-    for (let chunkStart = 0; chunkStart < pageList.length; chunkStart += PAGE_CHUNK_SIZE) {
-      const chunkEnd = Math.min(pageList.length, chunkStart + PAGE_CHUNK_SIZE);
+    const encodeCanvas = document.createElement('canvas');
+    const encodeCtx = encodeCanvas.getContext('2d');
+    if (!encodeCtx) throw new Error('Failed to create encode canvas context for export.');
 
-      updateExportToast(`PDF 청크 생성 중 (${chunkStart + 1}-${chunkEnd}/${pageList.length})...`);
+    const pageCount = pageList.length;
+    const useSegmentedExport = pageCount >= 400;
+    let exportRenderScale = EXPORT_RENDER_SCALE;
+    let exportJpegQuality = EXPORT_JPEG_QUALITY;
+    let exportMaxCanvasDimension = EXPORT_MAX_CANVAS_DIMENSION;
+    let exportEncodeMaxDimension = EXPORT_MAX_CANVAS_DIMENSION;
+    let exportCheckpointInterval = 0;
+    let exportSegmentSize = 0;
 
-      const chunkDoc = await PDFDocument.create();
-      const useWebp = typeof chunkDoc.embedWebp === 'function';
-      const mime = useWebp ? 'image/webp' : 'image/jpeg';
+    if (pageCount >= 500) {
+      exportRenderScale = 0.85;
+      exportJpegQuality = 0.55;
+      exportMaxCanvasDimension = 1024;
+      exportEncodeMaxDimension = 768;
+      exportSegmentSize = 5;
+    } else if (pageCount >= 400) {
+      exportRenderScale = 1.1;
+      exportJpegQuality = 0.68;
+      exportMaxCanvasDimension = 1280;
+      exportEncodeMaxDimension = 960;
+      exportSegmentSize = 8;
+    }
 
-      for (let i = chunkStart; i < chunkEnd; i++) {
-        const item = pageList[i];
-        updateExportToast(`청크 처리 중 (${i + 1}/${pageList.length})...`);
+    console.debug('[Export]', 'settings', {
+      pageCount,
+      useSegmentedExport,
+      exportRenderScale,
+      exportJpegQuality,
+      exportMaxCanvasDimension,
+      exportEncodeMaxDimension,
+      exportSegmentSize,
+      exportCheckpointInterval,
+      exportSessionId,
+    });
+
+    logExportMemory('export start');
+    cancelActivePageRender();
+    pageCache.clear();
+    thumbnailCache.clear();
+
+    let useWebp = false;
+    let finalDoc = null;
+
+    if (useSegmentedExport) {
+      let segmentDoc = null;
+      let segmentIndex = 0;
+      let pagesInSegment = 0;
+
+      const flushExportSegment = async () => {
+        if (!segmentDoc || pagesInSegment === 0) return;
+
+        updateExportToast(`세그먼트 저장 중 (${segmentIndex + 1})...`);
+        console.debug('[Export]', `segment flush start ${segmentIndex + 1}`, `pages=${pagesInSegment}`);
+        logExportMemory(`segment flush start ${segmentIndex + 1}`);
+
+        const segmentBytes = await segmentDoc.save({ useObjectStreams: true });
+        if (typeof segmentDoc.cleanup === 'function') {
+          try {
+            await segmentDoc.cleanup();
+          } catch (_e) {}
+        }
+        segmentDoc = null;
+
+        await saveExportSegmentBytes(exportSessionId, segmentIndex, segmentBytes);
+        segmentIndex += 1;
+        pagesInSegment = 0;
+        exportSegmentCount = segmentIndex;
+
+        console.debug('[Export]', `segment saved ${segmentIndex}`, `bytes=${segmentBytes.length}`);
+        logExportMemory(`segment saved ${segmentIndex}`);
+        pageCache.clear();
+        thumbnailCache.clear();
+        await new Promise((r) => setTimeout(r, 150));
+      };
+
+      for (let i = 0; i < pageCount; i++) {
+        if (!segmentDoc) {
+          segmentDoc = await PDFDocument.create();
+        }
+
+        updateExportToast(`PDF 생성 중 (${i + 1}/${pageCount})...`);
+
+        const appendCurrentPage = async () => {
+          await appendExportPageToDoc({
+            doc: segmentDoc,
+            item: pageList[i],
+            pageIndex: i,
+            pageCount,
+            workCanvas,
+            scratchCanvas,
+            scratchCtx,
+            encodeCanvas,
+            encodeCtx,
+            exportRenderScale,
+            exportMaxCanvasDimension,
+            exportEncodeMaxDimension,
+            exportJpegQuality,
+            useWebp,
+          });
+        };
 
         try {
-          await renderPageToCanvas(item, EXPORT_RENDER_SCALE, workCanvas);
-          await downscaleCanvasInPlace(workCanvas, EXPORT_MAX_CANVAS_DIMENSION);
-
-          let imgObj = null;
           try {
-            const blob = await canvasToJpegBlob(workCanvas, EXPORT_JPEG_QUALITY, mime);
-            const bytes = new Uint8Array(await blob.arrayBuffer());
-            imgObj = useWebp ? await chunkDoc.embedWebp(bytes) : await chunkDoc.embedJpg(bytes);
-          } catch (_e) {
-            // webp/bytes fallback: jpeg/dataURL
-            const dataUrl = workCanvas.toDataURL('image/jpeg', EXPORT_JPEG_QUALITY);
-            imgObj = await chunkDoc.embedJpg(dataUrl);
+            await appendCurrentPage();
+          } catch (err) {
+            if (pagesInSegment > 0) {
+              console.warn('[Export]', `retry after segment flush (${i + 1}/${pageCount})`, err);
+              await flushExportSegment();
+              segmentDoc = await PDFDocument.create();
+              await appendCurrentPage();
+            } else {
+              throw err;
+            }
           }
 
-          const page = chunkDoc.addPage([imgObj.width, imgObj.height]);
-          page.drawImage(imgObj, {
-            x: 0,
-            y: 0,
-            width: imgObj.width,
-            height: imgObj.height,
-          });
+          pagesInSegment += 1;
+          if (pagesInSegment >= exportSegmentSize) {
+            await flushExportSegment();
+          }
+        } catch (err) {
+          console.error('[Export]', `page failed (${i + 1}/${pageCount})`, err);
+          throw err;
         } finally {
           try {
             workCanvas.width = 0;
             workCanvas.height = 0;
+            scratchCanvas.width = 0;
+            scratchCanvas.height = 0;
+            encodeCanvas.width = 0;
+            encodeCanvas.height = 0;
           } catch (_e) {}
         }
       }
 
-      // 청크 저장
-      await new Promise((r) => setTimeout(r, 10));
-      if (typeof chunkDoc.cleanup === 'function') {
-        try {
-          await chunkDoc.cleanup();
-        } catch (_e) {}
-      }
+      await flushExportSegment();
+      updateExportToast('PDF 병합 중...');
+      finalDoc = await mergeExportSegments(exportSessionId, segmentIndex, pageCount);
+      exportSegmentCount = 0;
+    } else {
+      finalDoc = await PDFDocument.create();
+      useWebp = typeof finalDoc.embedWebp === 'function';
 
-      const chunkBytes = await chunkDoc.save({ useObjectStreams: true });
-      chunkPdfBytesList.push(chunkBytes);
+      for (let i = 0; i < pageCount; i++) {
+        updateExportToast(`PDF 생성 중 (${i + 1}/${pageCount})...`);
+
+        try {
+          await appendExportPageToDoc({
+            doc: finalDoc,
+            item: pageList[i],
+            pageIndex: i,
+            pageCount,
+            workCanvas,
+            scratchCanvas,
+            scratchCtx,
+            encodeCanvas,
+            encodeCtx,
+            exportRenderScale,
+            exportMaxCanvasDimension,
+            exportEncodeMaxDimension,
+            exportJpegQuality,
+            useWebp,
+          });
+
+          if (
+            exportCheckpointInterval > 0 &&
+            (i + 1) % exportCheckpointInterval === 0 &&
+            i + 1 < pageCount
+          ) {
+            updateExportToast(`메모리 정리 중 (${i + 1}/${pageCount})...`);
+            finalDoc = await compactExportPdfDoc(finalDoc, `(${i + 1}/${pageCount})`);
+          }
+
+          if ((i + 1) % 5 === 0) {
+            pageCache.clear();
+            await new Promise((r) => setTimeout(r, 0));
+          }
+        } catch (err) {
+          console.error('[Export]', `page failed (${i + 1}/${pageCount})`, err);
+          throw err;
+        } finally {
+          try {
+            workCanvas.width = 0;
+            workCanvas.height = 0;
+            scratchCanvas.width = 0;
+            scratchCanvas.height = 0;
+            encodeCanvas.width = 0;
+            encodeCanvas.height = 0;
+          } catch (_e) {}
+        }
+      }
     }
 
-    // 청크 PDF 합치기
-    updateExportToast('PDF 병합 중...');
-    const finalDoc = await PDFDocument.create();
-
-    for (let i = 0; i < chunkPdfBytesList.length; i++) {
-      updateExportToast(`PDF 병합 중 (${i + 1}/${chunkPdfBytesList.length})...`);
-      const chunkDoc = await PDFDocument.load(chunkPdfBytesList[i]);
-      const indices = chunkDoc.getPageIndices();
-      const copiedPages = await finalDoc.copyPages(chunkDoc, indices);
-      copiedPages.forEach((p) => finalDoc.addPage(p));
-
-      if (typeof chunkDoc.cleanup === 'function') {
-        try {
-          await chunkDoc.cleanup();
-        } catch (_e) {}
-      }
-    }
-
+    updateExportToast('PDF 저장 준비 중...');
+    console.debug('[Export]', 'final save start', `pages=${finalDoc.getPageCount()}`);
+    logExportMemory('final save start');
     const pdfBytes = await finalDoc.save({ useObjectStreams: true });
+    console.debug('[Export]', 'final save done', `bytes=${pdfBytes.length}`);
+    logExportMemory('final save done');
     const outBlob = new Blob([pdfBytes], { type: 'application/pdf' });
 
     // File System Access API로 선택된 위치에 바로 저장
@@ -2926,6 +3492,12 @@ btnExportPdf.addEventListener('click', async () => {
     console.error('PDF Export Error:', err);
     hideExportToast();
     showToast('PDF 생성에 실패했습니다.', 'error');
+  } finally {
+    if (exportSegmentCount > 0) {
+      try {
+        await clearExportSegments(exportSessionId, exportSegmentCount);
+      } catch (_e) {}
+    }
   }
 });
 
@@ -3097,6 +3669,7 @@ function showExportToast(message) {
 }
 
 function updateExportToast(message) {
+  console.debug('[Export]', message);
   if (!exportToastEl) return;
   const span = exportToastEl.querySelector('.export-toast-message');
   if (span) span.textContent = message;
