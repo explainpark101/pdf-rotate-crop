@@ -1,0 +1,70 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: |
+          bun install
+          bun install --cwd docs
+
+      - name: Build
+        run: bun run build
+        env:
+          VITE_BASE_PATH: /${{ github.event.repository.name }}/
+          VITE_APP_BUILD_ID: ${{ github.sha }}
+
+      - name: Verify build output
+        run: |
+          echo "Build output contents:"
+          ls -la dist/ || echo "dist folder not found"
+          if [ -f "dist/index.html" ]; then
+            echo "✓ index.html found"
+          else
+            echo "✗ index.html not found. build failed"
+            exit 1
+          fi
+          if [ -f "dist/docs/index.html" ]; then
+            echo "✓ docs/index.html found"
+          else
+            echo "✗ docs/index.html not found. VitePress build failed"
+            exit 1
+          fi
+
+      # GitHub Pages: 404 시 404.html을 반환함. SPA 라우트 직접 접근/새로고침 시
+      # 같은 앱을 로드하도록 index.html을 404.html로 복사한다.
+      - name: Add SPA fallback for GitHub Pages
+        run: cp dist/index.html dist/404.html
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: dist

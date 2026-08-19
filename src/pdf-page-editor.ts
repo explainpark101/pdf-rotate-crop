@@ -2,7 +2,7 @@
 import * as pdfjsLib from 'pdfjs-dist';
 import { PDFDocument } from 'pdf-lib';
 
-pdfjsLib.GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.min.js', import.meta.url).toString();
+pdfjsLib.GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url).toString();
 
 /* State Management */
 let pdfDoc = null;
@@ -11,7 +11,11 @@ let currentRenderTask = null;
 
 const pageCache = new Map();
 const thumbnailCache = new Map();
-let thumbnailObserver = null;
+
+const THUMB_ITEM_HEIGHT = 196;
+const THUMB_OVERSCAN = 3;
+let thumbnailVirtualList = null;
+let virtualScrollRaf = null;
 
 let pageList = [];
 let currentPageIndex = -1;
@@ -160,10 +164,6 @@ function getMainRenderScale(pdfPage) {
 function clearPdfCaches() {
   pageCache.clear();
   thumbnailCache.clear();
-  if (thumbnailObserver) {
-    thumbnailObserver.disconnect();
-    thumbnailObserver = null;
-  }
 }
 
 async function getPdfPageCached(pageNum) {
@@ -209,6 +209,7 @@ async function renderCurrentPage() {
   updateApplyRotationButtonVisibility(currentRot);
 
   updateSidebarActiveHighlight();
+  scrollThumbnailIntoView(currentPageIndex);
 
   const seq = ++renderSeq;
 
@@ -287,129 +288,200 @@ function applyCanvasRotation(deg) {
   pdfCanvas.style.transition = 'transform 0.15s ease-out';
 }
 
-function updateSidebarActiveHighlight() {
-  const cards = thumbnailContainer.children;
-  for (let i = 0; i < cards.length; i++) {
-    const card = cards[i];
-    const idx = parseInt(card.dataset.index, 10);
-    if (idx === currentPageIndex) {
-      card.classList.add('border-blue-600', 'ring-2', 'ring-blue-100', 'bg-blue-50/20');
-      card.classList.remove('border-slate-200', 'hover:border-slate-300');
-    } else {
-      card.classList.remove('border-blue-600', 'ring-2', 'ring-blue-100', 'bg-blue-50/20');
-      card.classList.add('border-slate-200', 'hover:border-slate-300');
-    }
+function ensureThumbnailVirtualList() {
+  if (!thumbnailVirtualList) {
+    thumbnailVirtualList = document.createElement('div');
+    thumbnailVirtualList.id = 'thumbnailVirtualList';
+    thumbnailVirtualList.className = 'relative w-full';
+    thumbnailContainer.appendChild(thumbnailVirtualList);
+    thumbnailContainer.addEventListener('scroll', onThumbnailScroll, { passive: true });
   }
+  return thumbnailVirtualList;
 }
 
-function setupThumbnailObserver() {
-  if (thumbnailObserver) thumbnailObserver.disconnect();
-
-  thumbnailObserver = new IntersectionObserver((entries, observer) => {
-    entries.forEach(entry => {
-      if (entry.isIntersecting) {
-        const card = entry.target;
-        const idx = parseInt(card.dataset.index, 10);
-        if (!isNaN(idx) && pageList[idx]) {
-          const canvas = card.querySelector('canvas');
-          if (canvas && !canvas.dataset.rendered) {
-            canvas.dataset.rendered = 'true';
-            renderThumbnailCanvas(pageList[idx], canvas);
-          }
-        }
-        observer.unobserve(card);
-      }
-    });
-  }, {
-    root: thumbnailContainer,
-    rootMargin: '100px'
+function onThumbnailScroll() {
+  if (virtualScrollRaf !== null) return;
+  virtualScrollRaf = requestAnimationFrame(() => {
+    virtualScrollRaf = null;
+    renderVisibleThumbnails();
   });
 }
 
-async function renderSidebarThumbnails() {
-  thumbnailContainer.innerHTML = '';
-  emptySidebarState.classList.add('hidden');
-  setupThumbnailObserver();
+function updateThumbCardAppearance(card, index) {
+  const isActive = index === currentPageIndex;
+  card.className = `group absolute left-0 right-0 bg-white border-2 rounded-xl p-2 cursor-pointer transition shadow-xs flex flex-col items-center ${
+    isActive ? 'border-blue-600 ring-2 ring-blue-100 bg-blue-50/20' : 'border-slate-200 hover:border-slate-300'
+  }`;
+}
 
-  for (let i = 0; i < pageList.length; i++) {
-    const item = pageList[i];
+function createThumbCard(index) {
+  const item = pageList[index];
+  const thumbCard = document.createElement('div');
+  thumbCard.dataset.index = String(index);
+  updateThumbCardAppearance(thumbCard, index);
 
-    const thumbCard = document.createElement('div');
-    thumbCard.className = `group relative bg-white border-2 rounded-xl p-2 cursor-pointer transition shadow-xs flex flex-col items-center ${
-      i === currentPageIndex ? 'border-blue-600 ring-2 ring-blue-100 bg-blue-50/20' : 'border-slate-200 hover:border-slate-300'
-    }`;
-    thumbCard.dataset.index = i;
+  const thumbCanvas = document.createElement('canvas');
+  thumbCanvas.className = 'w-full h-auto rounded border border-slate-100 bg-white object-contain max-h-36';
 
-    const thumbCanvas = document.createElement('canvas');
-    thumbCanvas.className = 'w-full h-auto rounded border border-slate-100 bg-white object-contain max-h-36';
+  const infoBar = document.createElement('div');
+  infoBar.className = 'w-full mt-2 flex items-center justify-between text-xs text-slate-500 font-medium px-1';
 
-    const infoBar = document.createElement('div');
-    infoBar.className = 'w-full mt-2 flex items-center justify-between text-xs text-slate-500 font-medium px-1';
+  const pageLabel = document.createElement('span');
+  pageLabel.className = 'flex items-center gap-1';
 
-    const pageLabel = document.createElement('span');
-    pageLabel.className = 'flex items-center gap-1';
+  const pageNumSpan = document.createElement('span');
+  pageNumSpan.className = 'font-bold text-slate-700';
+  pageNumSpan.textContent = index + 1;
+  pageLabel.appendChild(pageNumSpan);
 
-    const pageNumSpan = document.createElement('span');
-    pageNumSpan.className = 'font-bold text-slate-700';
-    pageNumSpan.textContent = i + 1;
-    pageLabel.appendChild(pageNumSpan);
+  const rotBadge = document.createElement('span');
+  rotBadge.className = `rot-badge text-[10px] text-blue-600 bg-blue-50 px-1 rounded ${isRotationZero(item.rotation) ? 'hidden' : ''}`;
+  rotBadge.textContent = formatRotationLabel(item.rotation);
+  pageLabel.appendChild(rotBadge);
 
-    const rotBadge = document.createElement('span');
-    rotBadge.className = `rot-badge text-[10px] text-blue-600 bg-blue-50 px-1 rounded ${isRotationZero(item.rotation) ? 'hidden' : ''}`;
-    rotBadge.textContent = formatRotationLabel(item.rotation);
-    pageLabel.appendChild(rotBadge);
+  if (item.customImageDataUrl) {
+    const cropBadge = document.createElement('span');
+    cropBadge.className = 'text-[10px] text-emerald-600 bg-emerald-50 px-1 rounded';
+    cropBadge.textContent = 'Cropped';
+    pageLabel.appendChild(cropBadge);
+  }
 
-    if (item.customImageDataUrl) {
-      const cropBadge = document.createElement('span');
-      cropBadge.className = 'text-[10px] text-emerald-600 bg-emerald-50 px-1 rounded';
-      cropBadge.textContent = 'Cropped';
-      pageLabel.appendChild(cropBadge);
+  const actions = document.createElement('div');
+  actions.className = 'flex items-center space-x-1 opacity-80 group-hover:opacity-100';
+
+  if (index > 0) {
+    const btnUp = document.createElement('button');
+    btnUp.className = 'p-1 hover:text-blue-600';
+    btnUp.title = 'Move up';
+    btnUp.innerHTML = '<i class="fa-solid fa-arrow-up text-[11px]"></i>';
+    btnUp.onclick = (e) => { e.stopPropagation(); movePage(index, index - 1); };
+    actions.appendChild(btnUp);
+  }
+  if (index < pageList.length - 1) {
+    const btnDown = document.createElement('button');
+    btnDown.className = 'p-1 hover:text-blue-600';
+    btnDown.title = 'Move down';
+    btnDown.innerHTML = '<i class="fa-solid fa-arrow-down text-[11px]"></i>';
+    btnDown.onclick = (e) => { e.stopPropagation(); movePage(index, index + 1); };
+    actions.appendChild(btnDown);
+  }
+
+  const btnDel = document.createElement('button');
+  btnDel.className = 'p-1 hover:text-rose-600 text-slate-400';
+  btnDel.title = 'Delete page';
+  btnDel.innerHTML = '<i class="fa-solid fa-trash-can text-[11px]"></i>';
+  btnDel.onclick = (e) => { e.stopPropagation(); deletePage(index); };
+  actions.appendChild(btnDel);
+
+  infoBar.appendChild(pageLabel);
+  infoBar.appendChild(actions);
+  thumbCard.appendChild(thumbCanvas);
+  thumbCard.appendChild(infoBar);
+
+  thumbCard.addEventListener('click', () => {
+    currentPageIndex = index;
+    renderCurrentPage();
+  });
+
+  return thumbCard;
+}
+
+function renderVisibleThumbnails() {
+  const list = thumbnailVirtualList;
+  if (!list || pageList.length === 0) return;
+
+  const scrollTop = thumbnailContainer.scrollTop;
+  const viewHeight = thumbnailContainer.clientHeight;
+  const startIndex = Math.max(0, Math.floor(scrollTop / THUMB_ITEM_HEIGHT) - THUMB_OVERSCAN);
+  const endIndex = Math.min(
+    pageList.length - 1,
+    Math.ceil((scrollTop + viewHeight) / THUMB_ITEM_HEIGHT) + THUMB_OVERSCAN
+  );
+
+  const existingCards = new Map();
+  list.querySelectorAll('[data-index]').forEach((card) => {
+    existingCards.set(parseInt(card.dataset.index, 10), card);
+  });
+
+  const visibleIndices = new Set();
+  for (let i = startIndex; i <= endIndex; i++) visibleIndices.add(i);
+
+  existingCards.forEach((card, index) => {
+    if (!visibleIndices.has(index)) card.remove();
+  });
+
+  for (let i = startIndex; i <= endIndex; i++) {
+    let card = existingCards.get(i);
+    if (!card) {
+      card = createThumbCard(i);
+      list.appendChild(card);
+    } else {
+      updateThumbCardAppearance(card, i);
+      const item = pageList[i];
+      const rotBadge = card.querySelector('.rot-badge');
+      if (rotBadge) {
+        if (isRotationZero(item.rotation)) {
+          rotBadge.classList.add('hidden');
+        } else {
+          rotBadge.textContent = formatRotationLabel(item.rotation);
+          rotBadge.classList.remove('hidden');
+        }
+      }
+      const canvas = card.querySelector('canvas');
+      if (canvas) canvas.style.transform = `rotate(${item.rotation}deg)`;
     }
 
-    const actions = document.createElement('div');
-    actions.className = 'flex items-center space-x-1 opacity-80 group-hover:opacity-100';
+    card.style.top = `${i * THUMB_ITEM_HEIGHT}px`;
+    card.style.height = `${THUMB_ITEM_HEIGHT - 12}px`;
 
-    if (i > 0) {
-      const btnUp = document.createElement('button');
-      btnUp.className = 'p-1 hover:text-blue-600';
-      btnUp.title = 'Move up';
-      btnUp.innerHTML = '<i class="fa-solid fa-arrow-up text-[11px]"></i>';
-      btnUp.onclick = (e) => { e.stopPropagation(); movePage(i, i - 1); };
-      actions.appendChild(btnUp);
-    }
-    if (i < pageList.length - 1) {
-      const btnDown = document.createElement('button');
-      btnDown.className = 'p-1 hover:text-blue-600';
-      btnDown.title = 'Move down';
-      btnDown.innerHTML = '<i class="fa-solid fa-arrow-down text-[11px]"></i>';
-      btnDown.onclick = (e) => { e.stopPropagation(); movePage(i, i + 1); };
-      actions.appendChild(btnDown);
-    }
-
-    const btnDel = document.createElement('button');
-    btnDel.className = 'p-1 hover:text-rose-600 text-slate-400';
-    btnDel.title = 'Delete page';
-    btnDel.innerHTML = '<i class="fa-solid fa-trash-can text-[11px]"></i>';
-    btnDel.onclick = (e) => { e.stopPropagation(); deletePage(i); };
-    actions.appendChild(btnDel);
-
-    infoBar.appendChild(pageLabel);
-    infoBar.appendChild(actions);
-
-    thumbCard.appendChild(thumbCanvas);
-    thumbCard.appendChild(infoBar);
-
-    thumbCard.addEventListener('click', () => {
-      currentPageIndex = i;
-      renderCurrentPage();
-    });
-
-    thumbnailContainer.appendChild(thumbCard);
-
-    if (thumbnailObserver) {
-      thumbnailObserver.observe(thumbCard);
+    const canvas = card.querySelector('canvas');
+    if (canvas && !canvas.dataset.rendered) {
+      canvas.dataset.rendered = 'true';
+      renderThumbnailCanvas(pageList[i], canvas);
     }
   }
+}
+
+function scrollThumbnailIntoView(index) {
+  if (!thumbnailVirtualList || pageList.length === 0 || index < 0) return;
+
+  const top = index * THUMB_ITEM_HEIGHT;
+  const bottom = top + THUMB_ITEM_HEIGHT;
+  const { scrollTop, clientHeight } = thumbnailContainer;
+
+  if (top < scrollTop) {
+    thumbnailContainer.scrollTop = top;
+  } else if (bottom > scrollTop + clientHeight) {
+    thumbnailContainer.scrollTop = bottom - clientHeight;
+  }
+
+  renderVisibleThumbnails();
+}
+
+function updateSidebarActiveHighlight() {
+  if (!thumbnailVirtualList) return;
+  thumbnailVirtualList.querySelectorAll('[data-index]').forEach((card) => {
+    const idx = parseInt(card.dataset.index, 10);
+    updateThumbCardAppearance(card, idx);
+  });
+}
+
+function renderSidebarThumbnails() {
+  if (pageList.length === 0) {
+    emptySidebarState.classList.remove('hidden');
+    if (thumbnailVirtualList) {
+      thumbnailVirtualList.classList.add('hidden');
+      thumbnailVirtualList.innerHTML = '';
+    }
+    return;
+  }
+
+  emptySidebarState.classList.add('hidden');
+  const list = ensureThumbnailVirtualList();
+  list.classList.remove('hidden');
+  list.style.height = `${pageList.length * THUMB_ITEM_HEIGHT}px`;
+  list.innerHTML = '';
+  renderVisibleThumbnails();
 }
 
 async function renderThumbnailCanvas(item, canvas) {
@@ -541,7 +613,7 @@ btnApplyRotationToPage.addEventListener('click', async () => {
 });
 
 function updateSidebarThumbnailRotation(index, deg) {
-  const card = thumbnailContainer.children[index];
+  const card = thumbnailVirtualList?.querySelector(`[data-index="${index}"]`);
   if (card) {
     const canvas = card.querySelector('canvas');
     if (canvas) canvas.style.transform = `rotate(${deg}deg)`;
