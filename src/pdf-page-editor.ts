@@ -2798,11 +2798,15 @@ async function renderFullPageToCanvas(item) {
 
 // Export용: 출력 PDF 크기를 줄이기 위한 다운스케일/압축 설정
 const EXPORT_RENDER_SCALE = 1.75;
-// 요청사항: JPEG 품질 1
-const EXPORT_JPEG_QUALITY = .9;
+const EXPORT_JPEG_QUALITY = 0.95;
 // Export 시 메모리/성능 절충용 다운스케일 상한
 // - 값이 너무 낮으면 저장된 고해상도 이미지가 다시 줄어들어 품질이 손상됩니다.
-const EXPORT_MAX_CANVAS_DIMENSION = 2400;
+const EXPORT_MAX_CANVAS_DIMENSION = 2600;
+
+function getExportMaxCanvasDimension() {
+  // crop/편집 저장 해상도보다 export 상한이 낮으면 품질이 저장 시점에 고정됩니다.
+  return Math.max(EXPORT_MAX_CANVAS_DIMENSION, PAGE_IMAGE_STORAGE_MAX_WIDTH);
+}
 
 function getScaledSize(width, height, maxDimension) {
   if (width <= maxDimension && height <= maxDimension) {
@@ -2975,8 +2979,9 @@ function logExportMemory(label) {
 async function encodeExportPageImage(canvas, quality, scratchCanvas, scratchCtx, encodeCanvas, encodeCtx) {
   const attempts = [
     { quality, maxDimension: null },
-    { quality: Math.max(0.48, quality - 0.1), maxDimension: 640 },
-    { quality: 0.4, maxDimension: 512 },
+    { quality: Math.max(0.8, quality - 0.06), maxDimension: null },
+    { quality: Math.max(0.72, quality - 0.12), maxDimension: 1600 },
+    { quality: 0.65, maxDimension: 1280 },
   ];
 
   let lastError = null;
@@ -3095,6 +3100,41 @@ async function clearExportSegments(sessionId, segmentCount) {
   }
 }
 
+async function clearAllExportSegmentStore() {
+  const db = await openExportSegDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(EXPORT_SEG_STORE, 'readwrite');
+    tx.objectStore(EXPORT_SEG_STORE).clear();
+    tx.oncomplete = () => {
+      db.close();
+      resolve(undefined);
+    };
+    tx.onerror = () => {
+      db.close();
+      reject(tx.error);
+    };
+  });
+}
+
+async function prepareIndexedDbForExport() {
+  console.debug('[Export]', 'preparing IndexedDB space...');
+  await clearAllExportSegmentStore();
+  await clearEditorSession();
+  console.debug('[Export]', 'IndexedDB space prepared');
+}
+
+async function saveExportSegmentBytesWithRetry(sessionId, index, bytes) {
+  try {
+    await saveExportSegmentBytes(sessionId, index, bytes);
+  } catch (err) {
+    if (err?.name !== 'QuotaExceededError') throw err;
+
+    console.warn('[Export]', `QuotaExceeded on segment ${index + 1}, clearing IndexedDB and retrying`);
+    await prepareIndexedDbForExport();
+    await saveExportSegmentBytes(sessionId, index, bytes);
+  }
+}
+
 async function mergeExportSegments(sessionId, segmentCount, pageCount) {
   let finalDoc = null;
 
@@ -3157,7 +3197,6 @@ async function appendExportPageToDoc({
   encodeCtx,
   exportRenderScale,
   exportMaxCanvasDimension,
-  exportEncodeMaxDimension,
   exportJpegQuality,
   useWebp,
 }) {
@@ -3177,8 +3216,8 @@ async function appendExportPageToDoc({
   );
   console.debug('[Export]', `render done (${pageIndex + 1}/${pageCount})`, `${workCanvas.width}x${workCanvas.height}`);
 
+  // renderExportPageToCanvas가 max dimension을 맞추지만, 회전 등으로 상한을 넘을 수 있어 1회만 보정합니다.
   downscaleCanvasForExport(workCanvas, exportMaxCanvasDimension, scratchCanvas, scratchCtx);
-  downscaleCanvasForExport(workCanvas, exportEncodeMaxDimension, scratchCanvas, scratchCtx);
   console.debug('[Export]', `downscale done (${pageIndex + 1}/${pageCount})`, `${workCanvas.width}x${workCanvas.height}`);
 
   pageCache.clear();
@@ -3274,24 +3313,16 @@ btnExportPdf.addEventListener('click', async () => {
 
     const pageCount = pageList.length;
     const useSegmentedExport = pageCount >= 400;
-    let exportRenderScale = EXPORT_RENDER_SCALE;
-    let exportJpegQuality = EXPORT_JPEG_QUALITY;
-    let exportMaxCanvasDimension = EXPORT_MAX_CANVAS_DIMENSION;
-    let exportEncodeMaxDimension = EXPORT_MAX_CANVAS_DIMENSION;
+    const exportRenderScale = EXPORT_RENDER_SCALE;
+    const exportJpegQuality = EXPORT_JPEG_QUALITY;
+    const exportMaxCanvasDimension = getExportMaxCanvasDimension();
     let exportCheckpointInterval = 0;
     let exportSegmentSize = 0;
 
+    // 대용량 export도 품질 설정은 동일하게 유지하고, OOM 방지는 세그먼트 크기로만 조절합니다.
     if (pageCount >= 500) {
-      exportRenderScale = 0.85;
-      exportJpegQuality = 0.55;
-      exportMaxCanvasDimension = 1024;
-      exportEncodeMaxDimension = 768;
       exportSegmentSize = 5;
     } else if (pageCount >= 400) {
-      exportRenderScale = 1.1;
-      exportJpegQuality = 0.68;
-      exportMaxCanvasDimension = 1280;
-      exportEncodeMaxDimension = 960;
       exportSegmentSize = 8;
     }
 
@@ -3301,7 +3332,6 @@ btnExportPdf.addEventListener('click', async () => {
       exportRenderScale,
       exportJpegQuality,
       exportMaxCanvasDimension,
-      exportEncodeMaxDimension,
       exportSegmentSize,
       exportCheckpointInterval,
       exportSessionId,
@@ -3316,6 +3346,9 @@ btnExportPdf.addEventListener('click', async () => {
     let finalDoc = null;
 
     if (useSegmentedExport) {
+      showToast('대용량 PDF 저장을 위해 IndexedDB 임시 데이터를 정리합니다.', 'info');
+      await prepareIndexedDbForExport();
+
       let segmentDoc = null;
       let segmentIndex = 0;
       let pagesInSegment = 0;
@@ -3335,7 +3368,7 @@ btnExportPdf.addEventListener('click', async () => {
         }
         segmentDoc = null;
 
-        await saveExportSegmentBytes(exportSessionId, segmentIndex, segmentBytes);
+        await saveExportSegmentBytesWithRetry(exportSessionId, segmentIndex, segmentBytes);
         segmentIndex += 1;
         pagesInSegment = 0;
         exportSegmentCount = segmentIndex;
@@ -3367,7 +3400,6 @@ btnExportPdf.addEventListener('click', async () => {
             encodeCtx,
             exportRenderScale,
             exportMaxCanvasDimension,
-            exportEncodeMaxDimension,
             exportJpegQuality,
             useWebp,
           });
@@ -3430,7 +3462,6 @@ btnExportPdf.addEventListener('click', async () => {
             encodeCtx,
             exportRenderScale,
             exportMaxCanvasDimension,
-            exportEncodeMaxDimension,
             exportJpegQuality,
             useWebp,
           });
@@ -3491,13 +3522,15 @@ btnExportPdf.addEventListener('click', async () => {
   } catch (err) {
     console.error('PDF Export Error:', err);
     hideExportToast();
-    showToast('PDF 생성에 실패했습니다.', 'error');
-  } finally {
-    if (exportSegmentCount > 0) {
-      try {
-        await clearExportSegments(exportSessionId, exportSegmentCount);
-      } catch (_e) {}
+    if (err?.name === 'QuotaExceededError') {
+      showToast('브라우저 저장 공간이 부족합니다. IndexedDB를 정리했지만 공간이 부족할 수 있습니다.', 'error');
+    } else {
+      showToast('PDF 생성에 실패했습니다.', 'error');
     }
+  } finally {
+    try {
+      await clearAllExportSegmentStore();
+    } catch (_e) {}
   }
 });
 
